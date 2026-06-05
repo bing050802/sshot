@@ -126,12 +126,15 @@ type Task struct {
 	AllowedExitCodes []int                  `yaml:"allowed_exit_codes,omitempty"`
 
 	Fetch *FetchTask `yaml:"fetch,omitempty"` // 新增 fetch 字段
+	File  *FileTask  `yaml:"file,omitempty"`  // 新增
 }
 
 type CopyTask struct {
-	Src  string `yaml:"src"`
-	Dest string `yaml:"dest"`
-	Mode string `yaml:"mode,omitempty"`
+	Src       string `yaml:"src"`                 // 本地源文件或目录路径
+	Dest      string `yaml:"dest"`                // 远程目标路径
+	Mode      string `yaml:"mode,omitempty"`      // 文件权限模式
+	Recursive bool   `yaml:"recursive,omitempty"` // 是否递归复制目录
+	Preserve  bool   `yaml:"preserve,omitempty"`  // 是否保留文件属性（权限、时间）
 }
 
 // 新增 FetchTask 结构体
@@ -146,4 +149,11 @@ type HostResult struct {
 	Success bool
 	Error   error
 	Output  string
+}
+
+// FileTask 文件操作任务
+type FileTask struct {
+	Path  string `yaml:"path"`           // 文件路径
+	State string `yaml:"state"`          // 状态: touch(创建空文件), absent(删除文件), directory(创建目录)
+	Mode  string `yaml:"mode,omitempty"` // 文件权限模式，如 "0644"
 }
