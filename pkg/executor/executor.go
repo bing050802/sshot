@@ -3,6 +3,8 @@ package executor
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
 
 	"github.com/fgouteroux/sshot/pkg/types"
@@ -38,12 +39,11 @@ type Executor struct {
 	OutputWriter   io.Writer
 	StartTime      time.Time
 
-	// 新增：常驻交互式bash会话（全局复用，一次切换sudo）
-	shellSess *ssh.Session
-	shellIn   io.WriteCloser
-
-	shellOut io.Reader
-	shellErr io.Reader
+	privilegedSess *ssh.Session
+	privilegedIn   io.WriteCloser
+	privilegedOut  io.Reader
+	privilegedErr  io.Reader
+	privMu         sync.Mutex // 保护特权 session 的互斥锁
 }
 
 // Singleton SSH agent client to avoid connection exhaustion
@@ -51,6 +51,127 @@ var (
 	sshAgentOnce   sync.Once
 	sshAgentClient agent.ExtendedAgent
 )
+
+// getPrivilegedSession 获取或创建特权 session（调用者必须持有 privMu 锁）
+func (e *Executor) getPrivilegedSession() (*ssh.Session, io.WriteCloser, io.Reader, error) {
+	// 注意：这个函数假设 privMu 已经被锁定
+	// 如果已有 session 且仍然活跃，直接返回
+	if e.privilegedSess != nil && e.privilegedIn != nil {
+		// 检查 session 是否还活着
+		if _, err := e.privilegedIn.Write([]byte("echo 'alive'\n")); err == nil {
+			return e.privilegedSess, e.privilegedIn, e.privilegedOut, nil
+		}
+		// session 已死，关闭并重新创建
+		e.privilegedSess.Close()
+	}
+
+	// 创建新的特权 session
+	sess, err := e.client.NewSession()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create session: %w", err)
+	}
+
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		sess.Close()
+		return nil, nil, nil, fmt.Errorf("failed to get stdin pipe: %w", err)
+	}
+
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		sess.Close()
+		return nil, nil, nil, fmt.Errorf("failed to get stdout pipe: %w", err)
+	}
+
+	stderr, err := sess.StderrPipe()
+	if err != nil {
+		sess.Close()
+		return nil, nil, nil, fmt.Errorf("failed to get stderr pipe: %w", err)
+	}
+	_ = stderr // 暂不使用
+
+	// 启动 bash
+	if err := sess.Start("/bin/bash"); err != nil {
+		sess.Close()
+		return nil, nil, nil, fmt.Errorf("failed to start bash: %w", err)
+	}
+
+	// 如果需要切换用户（如 Ubuntu 20.04）
+	if e.Host.BecomeUser != "" && e.Host.BecomePass != "" {
+		switchCmd := fmt.Sprintf("sudo -S -u %s /bin/bash\n", e.Host.BecomeUser)
+		if _, err := stdin.Write([]byte(switchCmd)); err != nil {
+			sess.Close()
+			return nil, nil, nil, fmt.Errorf("failed to switch user: %w", err)
+		}
+		if _, err := stdin.Write([]byte(e.Host.BecomePass + "\n")); err != nil {
+			sess.Close()
+			return nil, nil, nil, fmt.Errorf("failed to send sudo password: %w", err)
+		}
+
+		// 等待切换完成
+		time.Sleep(500 * time.Millisecond)
+
+		// 读取并丢弃欢迎信息
+		buf := make([]byte, 4096)
+		stdout.Read(buf)
+	}
+
+	// 缓存 session
+	e.privilegedSess = sess
+	e.privilegedIn = stdin
+	e.privilegedOut = stdout
+
+	return sess, stdin, stdout, nil
+}
+
+// executeCommandWithPrivilege 使用特权 session 执行命令（用于需要 sudo 的场景）
+func (e *Executor) executeCommandWithPrivilege(cmd string) (string, error) {
+	e.privMu.Lock()
+	defer e.privMu.Unlock()
+
+	_, stdin, _, err := e.getPrivilegedSession()
+	if err != nil {
+		return "", err
+	}
+
+	// 使用临时文件捕获输出
+	tmpFile := fmt.Sprintf("/tmp/.priv_out_%d_%d", time.Now().UnixNano(), os.Getpid())
+	wrappedCmd := fmt.Sprintf("%s > '%s' 2>&1; echo $? >> '%s'; cat '%s'; rm -f '%s'\n",
+		cmd, tmpFile, tmpFile, tmpFile, tmpFile)
+
+	if _, err := stdin.Write([]byte(wrappedCmd)); err != nil {
+		return "", fmt.Errorf("failed to write command: %w", err)
+	}
+
+	// 等待命令执行
+	time.Sleep(100 * time.Millisecond)
+
+	// 读取结果
+	result, err := e.executeCommandWithNewSession(fmt.Sprintf("cat '%s' 2>/dev/null", tmpFile))
+	e.executeCommandWithNewSession(fmt.Sprintf("rm -f '%s'", tmpFile))
+
+	if err != nil {
+		return result, err
+	}
+
+	// 解析退出码
+	result = strings.TrimSpace(result)
+	lines := strings.Split(result, "\n")
+	if len(lines) > 0 {
+		lastLine := strings.TrimSpace(lines[len(lines)-1])
+		if code, err := strconv.Atoi(lastLine); err == nil && code != 0 {
+			output := strings.Join(lines[:len(lines)-1], "\n")
+			return output, fmt.Errorf("exit status %d", code)
+		}
+		if len(lines) > 1 {
+			result = strings.Join(lines[:len(lines)-1], "\n")
+		} else {
+			result = ""
+		}
+	}
+
+	return result, nil
+}
 
 func (e *Executor) CollectFacts(factsConfig types.FactsConfig) error {
 	writer := e.OutputWriter
@@ -63,7 +184,6 @@ func (e *Executor) CollectFacts(factsConfig types.FactsConfig) error {
 			utils.Color(utils.ColorCyan), utils.Color(utils.ColorReset), len(factsConfig.Collectors))
 	}
 
-	// Initialize variables map if nil
 	if e.Variables == nil {
 		e.Variables = make(map[string]interface{})
 	}
@@ -76,48 +196,37 @@ func (e *Executor) CollectFacts(factsConfig types.FactsConfig) error {
 		var err error
 
 		if types.ExecOptions.DryRun {
-			// In dry-run mode, just show what would be executed
-			fmt.Fprintf(writer, "    %s🔍 DRY-RUN:%s Would execute: %s\n",
-				utils.Color(utils.ColorYellow), utils.Color(utils.ColorReset), collector.Command)
-
-			// For testing purposes, in dry-run mode, we'll simulate JSON output
-			// This allows tests to run without an actual SSH connection
 			output = `{"simulated": "data", "dry_run": true}`
-
-			if strings.Contains(collector.Command, "echo") {
-				// If the command is an echo command, extract the JSON from it for testing
-				jsonStart := strings.Index(collector.Command, "echo '") + 6
-				jsonEnd := strings.LastIndex(collector.Command, "'")
-				if jsonStart > 6 && jsonEnd > jsonStart {
-					output = collector.Command[jsonStart:jsonEnd]
-				}
-			}
 		} else {
-			// In real mode, execute the command
 			output, err = e.executeCommand(collector.Command, collector.Sudo)
 			if err != nil {
 				return fmt.Errorf("failed to collect facts with %s: %w", collector.Name, err)
 			}
 		}
 
-		// Try to parse as JSON
+		// 尝试解析为 JSON
 		var factData map[string]interface{}
 		if err := json.Unmarshal([]byte(output), &factData); err != nil {
-			return fmt.Errorf("failed to parse facts output as JSON: %w", err)
-		}
+			// 如果不是 JSON，作为字符串存储
+			e.Variables[collector.Name] = output
+			if types.ExecOptions.Verbose {
+				fmt.Fprintf(writer, "    %s→%s Stored as string (not JSON)\n",
+					utils.Color(utils.ColorGray), utils.Color(utils.ColorReset))
+			}
+		} else {
+			// 存储 JSON 结构
+			e.Variables[collector.Name] = factData
 
-		// Store the facts under the collector name
-		e.Variables[collector.Name] = factData
+			// 扁平化存储便于直接访问
+			flattened := FlattenMap(factData, collector.Name+".")
+			for k, v := range flattened {
+				e.Variables[k] = v
+			}
 
-		// Also flatten the structure for easier access in string templates
-		flattened := FlattenMap(factData, collector.Name+".")
-		for k, v := range flattened {
-			e.Variables[k] = v
-		}
-
-		if types.ExecOptions.Verbose {
-			fmt.Fprintf(writer, "    %s→%s Collected %d fact entries\n",
-				utils.Color(utils.ColorGray), utils.Color(utils.ColorReset), len(flattened))
+			if types.ExecOptions.Verbose {
+				fmt.Fprintf(writer, "    %s→%s Collected %d fact entries\n",
+					utils.Color(utils.ColorGray), utils.Color(utils.ColorReset), len(flattened))
+			}
 		}
 	}
 
@@ -155,6 +264,17 @@ func FlattenMap(data map[string]interface{}, prefix string) map[string]string {
 }
 
 func (e *Executor) ExecuteTask(task types.Task) error {
+
+	if e.Registers == nil {
+		e.Registers = make(map[string]string)
+	}
+	if e.Variables == nil {
+		e.Variables = make(map[string]interface{})
+	}
+	if e.CompletedTasks == nil {
+		e.CompletedTasks = make(map[string]bool)
+	}
+
 	writer := e.OutputWriter
 	if writer == nil {
 		writer = os.Stdout
@@ -538,12 +658,23 @@ func (e *Executor) ExecuteTask(task types.Task) error {
 	}
 
 	if task.Register != "" {
+		// 确保 maps 已初始化
+		if e.Registers == nil {
+			e.Registers = make(map[string]string)
+		}
+		if e.Variables == nil {
+			e.Variables = make(map[string]interface{})
+		}
+
+		// 注册输出
 		e.Registers[task.Register] = output
 		e.Variables[task.Register] = output
+
 		if types.ExecOptions.Verbose {
 			e.mu.Lock()
 			log.SetOutput(writer)
-			log.Printf("[VERBOSE] [%s] Registered output to: %s", e.Host.Name, task.Register)
+			log.Printf("[VERBOSE] [%s] Registered output to: %s (length: %d bytes)",
+				e.Host.Name, task.Register, len(output))
 			log.SetOutput(os.Stderr)
 			e.mu.Unlock()
 		}
@@ -623,9 +754,9 @@ func (e *Executor) executeCommand(cmd string, sudo bool) (string, error) {
 		return "DRY-RUN: Command would execute", nil
 	}
 
-	// 分支1：使用全局常驻shell（推荐，已提前切become_user）
-	//if e.shellIn != nil && e.shellSess != nil {
-	//	return e.execViaPersistentShell(cmd+"\n", writer, sudo)
+	// 如果需要 sudo 并且配置了 become，使用特权 session
+	//if sudo && (e.Host.BecomeUser != "" || e.Host.BecomePass != "") {
+	//	return e.executeCommandWithPrivilege(cmd)
 	//}
 
 	// 分支2：降级原有单次session逻辑（无shell场景兼容）
@@ -661,71 +792,6 @@ func (e *Executor) executeCommand(cmd string, sudo bool) (string, error) {
 
 	if err != nil {
 		return output, fmt.Errorf("command failed: %w", err)
-	}
-
-	return output, nil
-}
-
-// execViaPersistentShell 通过常驻交互式bash执行命令
-// execViaPersistentShell 通过常驻交互式bash执行命令
-func (e *Executor) execViaPersistentShell(cmd string, writer io.Writer, needSudo bool) (string, error) {
-	// 使用唯一临时文件
-	tmpFile := fmt.Sprintf("/tmp/.sh_out_%d_%d", time.Now().UnixNano(), os.Getpid())
-	rawCmd := strings.TrimSuffix(cmd, "\n")
-
-	// 构建命令：执行命令，输出到临时文件，最后打印退出码
-	wrap := fmt.Sprintf("%s > '%s' 2>&1; echo $? >> '%s'; cat '%s'; rm -f '%s'\n",
-		rawCmd, tmpFile, tmpFile, tmpFile, tmpFile)
-
-	if types.ExecOptions.Verbose {
-		e.mu.Lock()
-		log.Printf("[VERBOSE] Sending command to persistent shell: %s", rawCmd[:min(len(rawCmd), 100)])
-		e.mu.Unlock()
-	}
-
-	// 下发指令到shell标准输入
-	if _, err := e.shellIn.Write([]byte(wrap)); err != nil {
-		return "", fmt.Errorf("write shell stdin err: %w", err)
-	}
-
-	// 等待一小段时间让命令执行
-	time.Sleep(100 * time.Millisecond)
-
-	// 使用独立 session 读取临时文件内容（避免从 e.shellOut 读取的竞态问题）
-	readCmd := fmt.Sprintf("cat '%s' 2>/dev/null", tmpFile)
-	output, err := e.executeCommandWithNewSession(readCmd)
-
-	// 清理临时文件
-	cleanupCmd := fmt.Sprintf("rm -f '%s'", tmpFile)
-	_, _ = e.executeCommandWithNewSession(cleanupCmd)
-
-	if err != nil && !strings.Contains(err.Error(), "exit status 1") {
-		return output, err
-	}
-
-	// 解析输出和退出码
-	output = strings.TrimSpace(output)
-	lines := strings.Split(output, "\n")
-
-	if len(lines) == 0 {
-		return "", nil
-	}
-
-	// 最后一行是退出码
-	lastLine := strings.TrimSpace(lines[len(lines)-1])
-	exitCode := 0
-	if code, parseErr := strconv.Atoi(lastLine); parseErr == nil {
-		exitCode = code
-		// 移除退出码行
-		if len(lines) > 1 {
-			output = strings.Join(lines[:len(lines)-1], "\n")
-		} else {
-			output = ""
-		}
-	}
-
-	if exitCode != 0 {
-		return output, fmt.Errorf("exit status %d", exitCode)
 	}
 
 	return output, nil
@@ -980,77 +1046,198 @@ func (e *Executor) executeWaitFor(condition string) (string, error) {
 }
 
 // SubstituteVars 替换字符串中的变量
+// SubstituteVars 替换字符串中的变量，支持 JSON 路径访问
+// 支持格式：
+//
+//	{{ variable }}           - 直接变量
+//	{{ variable.key }}       - 嵌套 map 访问
+//	{{ variable[0] }}        - 数组索引访问
+//	{{ variable.key[0].sub }} - 混合访问
 func (e *Executor) SubstituteVars(text string) string {
 	if text == "" {
 		return text
 	}
 
-	// 方法1：使用正则表达式替换 {{ variable }} 格式
+	// 合并所有变量源
+	allVars := e.getAllVariables()
+
+	// 正则表达式匹配 {{ path }}
 	re := regexp.MustCompile(`{{\s*([^{}]+?)\s*}}`)
-
 	result := re.ReplaceAllStringFunc(text, func(match string) string {
-		// 提取变量名
-		varName := strings.TrimSpace(match[2 : len(match)-2])
-
-		// 尝试从 Variables 中获取值
-		if val, exists := e.Variables[varName]; exists {
-			return fmt.Sprintf("%v", val)
-		}
-
-		// 尝试从 Host.Vars 中获取
-		if e.Host.Vars != nil {
-			if val, exists := e.Host.Vars[varName]; exists {
-				return fmt.Sprintf("%v", val)
-			}
-		}
-
-		// 如果变量不存在，返回原字符串
-		return match
+		path := strings.TrimSpace(match[2 : len(match)-2])
+		value := e.extractValueByPath(allVars, path)
+		return fmt.Sprintf("%v", value)
 	})
-
-	// 方法2：也支持 {{ .Variable }} 格式（带点号）
-	if result == text {
-		// 创建 template 作为后备方案
-		funcMap := template.FuncMap{
-			"fact": func(path string) string {
-				parts := strings.Split(path, ".")
-				if len(parts) < 1 {
-					return ""
-				}
-
-				current, exists := e.Variables[parts[0]]
-				if !exists {
-					return ""
-				}
-
-				for i := 1; i < len(parts); i++ {
-					if m, ok := current.(map[string]interface{}); ok {
-						var exists bool
-						current, exists = m[parts[i]]
-						if !exists {
-							return ""
-						}
-					} else {
-						return ""
-					}
-				}
-
-				return fmt.Sprintf("%v", current)
-			},
-		}
-
-		tmpl, err := template.New("vars").Funcs(funcMap).Parse(text)
-		if err == nil {
-			var buf bytes.Buffer
-			if err := tmpl.Execute(&buf, e.Variables); err == nil {
-				result = buf.String()
-			}
-		}
-	}
 
 	return result
 }
 
+// getAllVariables 合并所有变量源
+func (e *Executor) getAllVariables() map[string]interface{} {
+	allVars := make(map[string]interface{})
+
+	// 1. Host.Vars
+	if e.Host.Vars != nil {
+		for k, v := range e.Host.Vars {
+			allVars[k] = v
+		}
+	}
+
+	// 2. Variables (facts 等)
+	if e.Variables != nil {
+		for k, v := range e.Variables {
+			allVars[k] = v
+		}
+	}
+
+	// 3. Registers (任务输出)
+	if e.Registers != nil {
+		for k, v := range e.Registers {
+			allVars[k] = v
+		}
+	}
+
+	return allVars
+}
+
+// extractValueByPath 根据路径提取值
+// 支持格式：
+//
+//	user.name
+//	users[0].name
+//	data.results[2].value
+func (e *Executor) extractValueByPath(data map[string]interface{}, path string) interface{} {
+	if path == "" {
+		return ""
+	}
+
+	// 分割路径
+	parts := e.parsePath(path)
+	var current interface{} = data
+
+	for _, part := range parts {
+		if current == nil {
+			return ""
+		}
+
+		// 处理数组索引: [0] 或 [index]
+		if strings.HasPrefix(part, "[") && strings.HasSuffix(part, "]") {
+			indexStr := part[1 : len(part)-1]
+			index, err := strconv.Atoi(indexStr)
+			if err != nil {
+				return ""
+			}
+
+			// 尝试转换为数组
+			switch v := current.(type) {
+			case []interface{}:
+				if index >= 0 && index < len(v) {
+					current = v[index]
+				} else {
+					return ""
+				}
+			case []string:
+				if index >= 0 && index < len(v) {
+					current = v[index]
+				} else {
+					return ""
+				}
+			default:
+				return ""
+			}
+		} else {
+			// 处理 map 访问
+			switch v := current.(type) {
+			case map[string]interface{}:
+				if val, exists := v[part]; exists {
+					current = val
+				} else {
+					return ""
+				}
+			case map[string]string:
+				if val, exists := v[part]; exists {
+					current = val
+				} else {
+					return ""
+				}
+			default:
+				return ""
+			}
+		}
+	}
+
+	// 转换为字符串
+	return e.valueToString(current)
+}
+
+// parsePath 解析路径字符串为部分
+// 例如: "users[0].name" -> ["users", "[0]", "name"]
+func (e *Executor) parsePath(path string) []string {
+	var parts []string
+	var current strings.Builder
+	inBracket := false
+
+	for i := 0; i < len(path); i++ {
+		ch := path[i]
+
+		if ch == '[' {
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+			inBracket = true
+			current.WriteByte(ch)
+		} else if ch == ']' {
+			current.WriteByte(ch)
+			parts = append(parts, current.String())
+			current.Reset()
+			inBracket = false
+		} else if ch == '.' && !inBracket {
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+		} else {
+			current.WriteByte(ch)
+		}
+	}
+
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
+	}
+
+	return parts
+}
+
+// valueToString 将任意值转换为字符串
+func (e *Executor) valueToString(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+
+	switch v := value.(type) {
+	case string:
+		return v
+	case int, int32, int64, float32, float64, bool:
+		return fmt.Sprintf("%v", v)
+	case []interface{}:
+		// 如果是数组，返回 JSON 格式
+		jsonBytes, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(jsonBytes)
+	case map[string]interface{}:
+		// 如果是对象，返回 JSON 格式
+		jsonBytes, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(jsonBytes)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
 func (e *Executor) evaluateCondition(condition string) bool {
 	condition = strings.TrimSpace(condition)
 
@@ -1373,39 +1560,18 @@ func NewExecutor(host types.Host, groupName string) (*Executor, error) {
 		log.Printf("[VERBOSE] [%s] Successfully connected", host.Name)
 	}
 
-	// ========== 新增：初始化常驻交互式bash + become切换 ==========
-	var shellSess *ssh.Session
-	var shellIn io.WriteCloser
-
-	var shellOut io.Reader
-	var shellErr io.Reader
-	sess, err := client.NewSession()
-	if err == nil {
-		stdin, err := sess.StdinPipe()
-		if err == nil {
-			outR, _ := sess.StdoutPipe()
-			errR, _ := sess.StderrPipe()
-			// 开启交互式bash
-			err = sess.Start("/bin/bash")
-			if err == nil {
-				shellSess = sess
-				shellIn = stdin
-				shellOut = outR
-				shellErr = errR
-
-				// 配置了become_user则执行sudo切换
-				if host.BecomeUser != "" && host.BecomePass != "" {
-					// sudo -S -u 目标用户 bash，-S从标准输入读密码
-					switchCmd := fmt.Sprintf("sudo -S -u %s /bin/bash\n", host.BecomeUser)
-					_, _ = stdin.Write([]byte(switchCmd))
-					// 写入sudo密码
-					_, _ = stdin.Write([]byte(host.BecomePass + "\n"))
-					if types.ExecOptions.Verbose {
-						log.Printf("[VERBOSE] [%s] Switch user via sudo to: %s", host.Name, host.BecomeUser)
-					}
+	if client != nil {
+		// 每 30 秒发送一个 keepalive
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				_, _, err := client.SendRequest("keepalive@sshot", true, nil)
+				if err != nil {
+					return
 				}
 			}
-		}
+		}()
 	}
 
 	return &Executor{
@@ -1417,12 +1583,6 @@ func NewExecutor(host types.Host, groupName string) (*Executor, error) {
 		GroupName:      groupName,
 		OutputWriter:   os.Stdout,
 		StartTime:      time.Now(),
-
-		// 赋值常驻shell
-		shellSess: shellSess,
-		shellIn:   shellIn,
-		shellErr:  shellErr,
-		shellOut:  shellOut,
 	}, nil
 }
 
@@ -1692,11 +1852,17 @@ func (e *Executor) fetchDirectory(remotePath, localPath string, flat bool) (stri
 		return "", fmt.Errorf("cannot fetch directory with flat=true, use flat=false for directories")
 	}
 
-	// 生成远程文件列表命令
-	listCmd := fmt.Sprintf("find '%s' -type f 2>/dev/null", remotePath)
+	if types.ExecOptions.Verbose {
+		e.mu.Lock()
+		fmt.Fprintf(writer, "    │ Listing remote directory: %s\n", remotePath)
+		e.mu.Unlock()
+	}
 
-	// 获取文件列表
-	fileListOutput, err := e.executeCommand(listCmd, false)
+	// 生成远程文件列表
+	listCmd := fmt.Sprintf("find '%s' -type f 2>/dev/null | sort", remotePath)
+
+	// 使用新 session 获取文件列表
+	fileListOutput, err := e.executeCommandWithNewSession(listCmd)
 	if err != nil {
 		return "", fmt.Errorf("failed to list remote directory: %w", err)
 	}
@@ -1707,13 +1873,42 @@ func (e *Executor) fetchDirectory(remotePath, localPath string, flat bool) (stri
 		return "", fmt.Errorf("no files found in remote directory: %s", remotePath)
 	}
 
+	totalFiles := len(files)
+	if types.ExecOptions.Verbose {
+		e.mu.Lock()
+		fmt.Fprintf(writer, "    │ Found %d files to fetch\n", totalFiles)
+		e.mu.Unlock()
+	}
+
 	successCount := 0
 	var errors []string
 
-	for _, remoteFile := range files {
+	// 创建进度通道
+	//progress := make(chan struct {
+	//	file string
+	//	err  error
+	//}, 1)
+
+	// 使用带超时的 context
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	for i, remoteFile := range files {
 		remoteFile = strings.TrimSpace(remoteFile)
 		if remoteFile == "" {
 			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			// 超时处理
+			e.mu.Lock()
+			fmt.Fprintf(writer, "    │ ⏰ Timeout reached, fetched %d/%d files\n", successCount, totalFiles)
+			e.mu.Unlock()
+			return fmt.Sprintf("Fetched %d/%d files (timeout)", successCount, totalFiles),
+				fmt.Errorf("timeout after fetching %d files", successCount)
+		default:
+			// 继续下载
 		}
 
 		// 计算相对路径
@@ -1732,9 +1927,19 @@ func (e *Executor) fetchDirectory(remotePath, localPath string, flat bool) (stri
 			continue
 		}
 
-		// 拉取文件
-		if err := e.downloadFileViaSFTP(remoteFile, localFilePath); err != nil {
+		// 显示进度
+		if types.ExecOptions.Verbose {
+			e.mu.Lock()
+			fmt.Fprintf(writer, "    │ [%d/%d] Downloading: %s\n", i+1, totalFiles, filepath.Base(remoteFile))
+			e.mu.Unlock()
+		}
+
+		// 拉取文件（带重试）
+		if err := e.downloadFileWithRetry(remoteFile, localFilePath, 3); err != nil {
 			errors = append(errors, fmt.Sprintf("failed to fetch %s: %v", remoteFile, err))
+			e.mu.Lock()
+			fmt.Fprintf(writer, "    │ ✗ Failed: %s - %v\n", filepath.Base(remoteFile), err)
+			e.mu.Unlock()
 			continue
 		}
 
@@ -1742,18 +1947,68 @@ func (e *Executor) fetchDirectory(remotePath, localPath string, flat bool) (stri
 
 		if types.ExecOptions.Verbose {
 			e.mu.Lock()
-			fmt.Fprintf(writer, "    │ Fetched: %s → %s\n", remoteFile, localFilePath)
+			fmt.Fprintf(writer, "    │ ✓ Fetched: %s\n", filepath.Base(remoteFile))
 			e.mu.Unlock()
 		}
 	}
 
+	// 最终报告
+	e.mu.Lock()
+	fmt.Fprintf(writer, "\n    │ %sFetch Summary:%s Fetched %d/%d files\n",
+		utils.Color(utils.ColorGreen), utils.Color(utils.ColorReset), successCount, totalFiles)
+	if len(errors) > 0 {
+		fmt.Fprintf(writer, "    │ %sErrors:%s %d failures\n",
+			utils.Color(utils.ColorRed), utils.Color(utils.ColorReset), len(errors))
+		for _, errMsg := range errors {
+			fmt.Fprintf(writer, "    │   - %s\n", errMsg)
+		}
+	}
+	e.mu.Unlock()
+
 	if len(errors) > 0 {
 		return fmt.Sprintf("Fetched %d/%d files from %s to %s, errors: %s",
-				successCount, len(files), remotePath, localPath, strings.Join(errors, "; ")),
+				successCount, totalFiles, remotePath, localPath, strings.Join(errors, "; ")),
 			fmt.Errorf("partial failure: %d errors", len(errors))
 	}
 
 	return fmt.Sprintf("Fetched %d files from %s to %s", successCount, remotePath, localPath), nil
+}
+
+// downloadFileWithRetry 带重试的文件下载
+func (e *Executor) downloadFileWithRetry(remotePath, localPath string, maxRetries int) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			if types.ExecOptions.Verbose {
+				e.mu.Lock()
+				fmt.Printf("    │ Retry %d/%d for %s\n", attempt, maxRetries, filepath.Base(remotePath))
+				e.mu.Unlock()
+			}
+			time.Sleep(2 * time.Second) // 重试前等待
+		}
+
+		err := e.downloadFileViaSFTP(remotePath, localPath)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		// 检查是否是连接错误，如果是，重建 SFTP 客户端
+		if strings.Contains(err.Error(), "EOF") ||
+			strings.Contains(err.Error(), "connection lost") ||
+			strings.Contains(err.Error(), "timeout") {
+			if types.ExecOptions.Verbose {
+				e.mu.Lock()
+				fmt.Printf("    │ Connection lost, will retry\n")
+				e.mu.Unlock()
+			}
+			// 让下一次重试重新建立连接
+			continue
+		}
+	}
+
+	return fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 // downloadFile 下载单个文件（使用 SCP 协议）
@@ -1887,6 +2142,9 @@ func (e *Executor) downloadFile(remotePath, localPath string) error {
 
 	return nil
 }
+
+// downloadFileViaSFTP 使用 SFTP 下载文件（增强版）
+// downloadFileViaSFTP 支持断点续传的下载
 func (e *Executor) downloadFileViaSFTP(remotePath, localPath string) error {
 	// 创建 SFTP 客户端
 	sftpClient, err := sftp.NewClient(e.client)
@@ -1903,37 +2161,257 @@ func (e *Executor) downloadFileViaSFTP(remotePath, localPath string) error {
 	defer remoteFile.Close()
 
 	// 获取远程文件信息
-	fileInfo, err := remoteFile.Stat()
+	remoteInfo, err := remoteFile.Stat()
 	if err != nil {
 		return fmt.Errorf("failed to stat remote file: %w", err)
 	}
 
-	// 创建本地文件
-	localFile, err := os.Create(localPath)
-	if err != nil {
-		return fmt.Errorf("failed to create local file %s: %w", localPath, err)
-	}
-	defer localFile.Close()
+	// 检查本地文件
+	var localSize int64 = 0
+	var localFile *os.File
 
-	// 复制文件内容
-	written, err := io.Copy(localFile, remoteFile)
-	if err != nil {
-		return fmt.Errorf("failed to copy file content: %w", err)
+	if localInfo, err := os.Stat(localPath); err == nil {
+		localSize = localInfo.Size()
+
+		// 如果本地文件大小等于远程文件，验证完整性
+		if localSize == remoteInfo.Size() {
+			if valid, err := e.verifyFileIntegrity(remotePath, localPath); err == nil && valid {
+				if types.ExecOptions.Verbose {
+					e.mu.Lock()
+					fmt.Printf("    │ File already complete, skipping: %s\n", filepath.Base(remotePath))
+					e.mu.Unlock()
+				}
+				return nil
+			}
+		}
+
+		// 如果本地文件小于远程文件，断点续传
+		if localSize > 0 && localSize < remoteInfo.Size() {
+			if types.ExecOptions.Verbose {
+				e.mu.Lock()
+				fmt.Printf("    │ Resuming download from %d/%d bytes (%.1f%%)\n",
+					localSize, remoteInfo.Size(), float64(localSize)/float64(remoteInfo.Size())*100)
+				e.mu.Unlock()
+			}
+
+			// 打开本地文件用于追加
+			localFile, err = os.OpenFile(localPath, os.O_APPEND|os.O_WRONLY, 0644)
+			if err != nil {
+				return fmt.Errorf("failed to open local file for append: %w", err)
+			}
+			defer localFile.Close()
+		} else if localSize > remoteInfo.Size() {
+			// 本地文件比远程大，说明可能有问题，重新下载
+			if types.ExecOptions.Verbose {
+				e.mu.Lock()
+				fmt.Printf("    │ Local file larger than remote, re-downloading\n")
+				e.mu.Unlock()
+			}
+			os.Remove(localPath)
+			localSize = 0
+		}
 	}
 
-	if written != fileInfo.Size() {
-		return fmt.Errorf("file size mismatch: expected %d bytes, got %d bytes", fileInfo.Size(), written)
+	// 如果 localFile 为 nil，创建新文件
+	if localFile == nil {
+		localFile, err = os.Create(localPath)
+		if err != nil {
+			return fmt.Errorf("failed to create local file: %w", err)
+		}
+		defer localFile.Close()
 	}
 
-	// 保持文件权限
-	if err := localFile.Chmod(fileInfo.Mode()); err != nil {
-		// 权限设置失败不影响主要功能，只记录警告
+	// 从断点处开始读取
+	if localSize > 0 {
+		// 设置远程文件读取位置
+		_, err = remoteFile.Seek(localSize, io.SeekStart)
+		if err != nil {
+			return fmt.Errorf("failed to seek remote file: %w", err)
+		}
+	}
+
+	// 使用缓冲区下载
+	buffer := make([]byte, 32*1024) // 32KB buffer
+	totalWritten := localSize
+	lastReport := time.Now()
+
+	for {
+		// 设置读取超时
+
+		n, err := remoteFile.Read(buffer)
+		if n > 0 {
+			nw, err := localFile.Write(buffer[:n])
+			if err != nil {
+				return fmt.Errorf("failed to write to local file: %w", err)
+			}
+			totalWritten += int64(nw)
+
+			// 每5秒报告一次进度
+			if time.Since(lastReport) > 5*time.Second {
+				progress := float64(totalWritten) / float64(remoteInfo.Size()) * 100
+				if types.ExecOptions.Verbose {
+					e.mu.Lock()
+					fmt.Printf("    │ Progress: %.1f%% (%d/%d bytes)\n",
+						progress, totalWritten, remoteInfo.Size())
+					e.mu.Unlock()
+				}
+				lastReport = time.Now()
+			}
+		}
+
+		if err != nil {
+			if err == io.EOF {
+				break // 下载完成
+			}
+			// 超时或连接错误，可以重试
+			if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline") {
+				if types.ExecOptions.Verbose {
+					e.mu.Lock()
+					fmt.Printf("    │ Timeout, will retry... (saved %d/%d bytes)\n",
+						totalWritten, remoteInfo.Size())
+					e.mu.Unlock()
+				}
+				// 返回部分下载的错误，让上层重试
+				return fmt.Errorf("partial download: saved %d/%d bytes", totalWritten, remoteInfo.Size())
+			}
+			return fmt.Errorf("failed to read remote file: %w", err)
+		}
+	}
+
+	// 确保文件已写入磁盘
+	if err := localFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	// 验证下载完整性
+	if totalWritten != remoteInfo.Size() {
+		return fmt.Errorf("incomplete download: expected %d bytes, got %d bytes",
+			remoteInfo.Size(), totalWritten)
+	}
+
+	// 最终验证
+	if valid, err := e.verifyFileIntegrity(remotePath, localPath); err != nil || !valid {
+		if err != nil {
+			return fmt.Errorf("integrity check failed: %w", err)
+		}
+		return fmt.Errorf("integrity check failed: file may be corrupted")
+	}
+
+	// 设置文件权限和修改时间
+	if err := os.Chmod(localPath, remoteInfo.Mode()); err != nil {
 		if types.ExecOptions.Verbose {
 			e.mu.Lock()
-			fmt.Printf("Warning: failed to set file permissions: %v\n", err)
+			fmt.Printf("    │ Warning: failed to set permissions: %v\n", err)
 			e.mu.Unlock()
 		}
 	}
 
+	if err := os.Chtimes(localPath, remoteInfo.ModTime(), remoteInfo.ModTime()); err != nil {
+		if types.ExecOptions.Verbose {
+			e.mu.Lock()
+			fmt.Printf("    │ Warning: failed to set modification time: %v\n", err)
+			e.mu.Unlock()
+		}
+	}
+
+	if types.ExecOptions.Verbose {
+		e.mu.Lock()
+		fmt.Printf("    │ ✓ Download complete: %.2f MB\n", float64(totalWritten)/(1024*1024))
+		e.mu.Unlock()
+	}
+
 	return nil
+}
+
+// verifyFileIntegrity 验证文件完整性（通过比较文件大小和可选的内容校验）
+func (e *Executor) verifyFileIntegrity(remotePath, localPath string) (bool, error) {
+	// 获取远程文件信息
+	remoteCmd := fmt.Sprintf("stat -c '%%s' '%s'", remotePath)
+	remoteSizeStr, err := e.executeCommandWithNewSession(remoteCmd)
+	if err != nil {
+		return false, err
+	}
+	remoteSize, _ := strconv.ParseInt(strings.TrimSpace(remoteSizeStr), 10, 64)
+
+	// 获取本地文件信息
+	localInfo, err := os.Stat(localPath)
+	if err != nil {
+		return false, err
+	}
+
+	if localInfo.Size() != remoteSize {
+		return false, nil
+	}
+
+	// 对于大文件，只检查文件头尾的校验和（可选）
+	// 对于小文件，可以计算完整 MD5
+	if remoteSize < 100*1024*1024 { // 小于 100MB 的文件
+		remoteMD5, err := e.getRemoteMD5(remotePath)
+		if err == nil {
+			localMD5, err := getLocalMD5(localPath)
+			if err == nil && remoteMD5 != localMD5 {
+				return false, nil
+			}
+		}
+	}
+
+	return true, nil
+}
+
+// compareFileChecksum 比较远程和本地文件的 MD5 校验和
+func (e *Executor) compareFileChecksum(remotePath, localPath string) (bool, error) {
+	// 获取远程文件的 MD5
+	remoteMD5, err := e.getRemoteMD5(remotePath)
+	if err != nil {
+		return true, err
+	}
+
+	// 获取本地文件的 MD5
+	localMD5, err := getLocalMD5(localPath)
+	if err != nil {
+		return true, err
+	}
+
+	// 如果 MD5 相同，文件内容一致
+	if remoteMD5 == localMD5 {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// getRemoteMD5 获取远程文件的 MD5 值
+func (e *Executor) getRemoteMD5(remotePath string) (string, error) {
+	// 尝试使用 md5sum
+	md5Cmd := fmt.Sprintf("md5sum '%s' 2>/dev/null | cut -d' ' -f1", remotePath)
+	output, err := e.executeCommandWithNewSession(md5Cmd)
+	if err == nil && strings.TrimSpace(output) != "" {
+		return strings.TrimSpace(output), nil
+	}
+
+	// 尝试使用 md5（BSD 系统）
+	md5Cmd = fmt.Sprintf("md5 '%s' 2>/dev/null | awk '{print $NF}'", remotePath)
+	output, err = e.executeCommandWithNewSession(md5Cmd)
+	if err == nil && strings.TrimSpace(output) != "" {
+		return strings.TrimSpace(output), nil
+	}
+
+	// 如果都失败，返回错误
+	return "", fmt.Errorf("failed to get remote MD5 for %s", remotePath)
+}
+
+// getLocalMD5 获取本地文件的 MD5 值
+func getLocalMD5(localPath string) (string, error) {
+	file, err := os.Open(localPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
