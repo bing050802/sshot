@@ -2,7 +2,6 @@ package types
 
 import (
 	"sync"
-
 )
 
 var RunOnceTasks = struct {
@@ -89,6 +88,10 @@ type Host struct {
 	UseAgent           bool                   `yaml:"use_agent,omitempty"`
 	StrictHostKeyCheck *bool                  `yaml:"strict_host_key_check,omitempty"`
 	Vars               map[string]interface{} `yaml:"vars,omitempty"`
+
+	// 新增 become/sudo配置，对标ansible become_user、become_pass
+	BecomeUser string `yaml:"become_user,omitempty"` // 需要切换到的用户(root)
+	BecomePass string `yaml:"become_pass,omitempty"` // 登录用户的sudo密码
 }
 
 type Playbook struct {
@@ -121,6 +124,8 @@ type Task struct {
 	Timeout          int                    `yaml:"timeout,omitempty"`
 	UntilSuccess     bool                   `yaml:"until_success,omitempty"`
 	AllowedExitCodes []int                  `yaml:"allowed_exit_codes,omitempty"`
+
+	Fetch *FetchTask `yaml:"fetch,omitempty"` // 新增 fetch 字段
 }
 
 type CopyTask struct {
@@ -129,6 +134,12 @@ type CopyTask struct {
 	Mode string `yaml:"mode,omitempty"`
 }
 
+// 新增 FetchTask 结构体
+type FetchTask struct {
+	Src  string `yaml:"src"`  // 远程源文件或目录路径
+	Dest string `yaml:"dest"` // 本地目标路径
+	Flat bool   `yaml:"flat"` // 是否扁平化（不保留目录结构）
+}
 
 type HostResult struct {
 	Host    Host

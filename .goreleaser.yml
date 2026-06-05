@@ -11,9 +11,9 @@ builds:
     goos:
       - linux
       - darwin
+      - windows
     goarch:
       - amd64
-      - arm64
     ldflags: |
       -X main.Version={{.Version}}
       -X main.Commit={{.Commit}}
