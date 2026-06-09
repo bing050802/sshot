@@ -39,6 +39,9 @@ type Executor struct {
 	mu             sync.Mutex
 	OutputWriter   io.Writer
 	StartTime      time.Time
+
+	NotifyQueue  []string        // 新增：待执行的 handler 队列
+	HandlersDone map[string]bool // 新增：记录已执行的 handlers
 }
 
 // Singleton SSH agent client
@@ -121,7 +124,7 @@ func FlattenMap(data map[string]interface{}, prefix string) map[string]string {
 	return items
 }
 
-func (e *Executor) ExecuteTask(task types.Task) error {
+func (e *Executor) ExecuteTask(task types.Task, handlers []types.Task) error {
 	if e.Registers == nil {
 		e.Registers = make(map[string]string)
 	}
@@ -262,6 +265,10 @@ func (e *Executor) ExecuteTask(task types.Task) error {
 		output, err = e.executeFetch(task.Fetch)
 	case task.File != nil:
 		output, err = e.executeFile(task.File)
+	case task.Systemd != nil:
+		output, err = e.executeSystemd(task.Systemd)
+	case task.Archive != nil:
+		output, err = e.executeArchive(task.Archive)
 	case task.WaitFor != "":
 		output, err = e.executeWaitFor(task.WaitFor)
 	default:
@@ -276,6 +283,41 @@ func (e *Executor) ExecuteTask(task types.Task) error {
 			log.Printf("[VERBOSE] [%s] Registered output to: %s", e.Host.Name, task.Register)
 			e.mu.Unlock()
 		}
+	}
+
+	// 任务执行成功后，处理 notify
+	if err == nil && len(task.Notify) > 0 {
+		e.mu.Lock()
+		for _, handlerName := range task.Notify {
+			// 检查 handler 是否存在
+			handlerExists := false
+			for _, h := range handlers {
+				if h.Name == handlerName {
+					handlerExists = true
+					break
+				}
+			}
+			if !handlerExists {
+				e.mu.Unlock()
+				return fmt.Errorf("handler '%s' not found", handlerName)
+			}
+
+			// 添加到通知队列（去重）
+			alreadyQueued := false
+			for _, queued := range e.NotifyQueue {
+				if queued == handlerName {
+					alreadyQueued = true
+					break
+				}
+			}
+			if !alreadyQueued && !e.HandlersDone[handlerName] {
+				e.NotifyQueue = append(e.NotifyQueue, handlerName)
+				if types.ExecOptions.Verbose {
+					fmt.Fprintf(writer, "    │ Notified handler: %s\n", handlerName)
+				}
+			}
+		}
+		e.mu.Unlock()
 	}
 
 	if err != nil {
@@ -1022,6 +1064,8 @@ func NewExecutor(host types.Host, groupName string) (*Executor, error) {
 		Variables:      host.Vars,
 		Registers:      make(map[string]string),
 		CompletedTasks: make(map[string]bool),
+		NotifyQueue:    make([]string, 0),     // 新增
+		HandlersDone:   make(map[string]bool), // 新增
 		GroupName:      groupName,
 		OutputWriter:   os.Stdout,
 		StartTime:      time.Now(),

@@ -99,6 +99,7 @@ type Playbook struct {
 	Parallel bool        `yaml:"parallel,omitempty"`
 	Facts    FactsConfig `yaml:"facts,omitempty"`
 	Tasks    []Task      `yaml:"tasks"`
+	Handlers []Task      `yaml:"handlers,omitempty"` // 新增：handlers 列表
 }
 
 type Task struct {
@@ -125,8 +126,12 @@ type Task struct {
 	UntilSuccess     bool                   `yaml:"until_success,omitempty"`
 	AllowedExitCodes []int                  `yaml:"allowed_exit_codes,omitempty"`
 
-	Fetch *FetchTask `yaml:"fetch,omitempty"` // 新增 fetch 字段
-	File  *FileTask  `yaml:"file,omitempty"`  // 新增
+	Fetch   *FetchTask   `yaml:"fetch,omitempty"`   // 新增 fetch 字段
+	File    *FileTask    `yaml:"file,omitempty"`    // 新增
+	Systemd *SystemdTask `yaml:"systemd,omitempty"` // 新增
+	Archive *ArchiveTask `yaml:"archive,omitempty"`
+
+	Notify []string `yaml:"notify,omitempty"` // 新增：触发的 handler 名称列表
 }
 
 type CopyTask struct {
@@ -156,4 +161,21 @@ type FileTask struct {
 	Path  string `yaml:"path"`           // 文件路径
 	State string `yaml:"state"`          // 状态: touch(创建空文件), absent(删除文件), directory(创建目录)
 	Mode  string `yaml:"mode,omitempty"` // 文件权限模式，如 "0644"
+}
+
+// SystemdTask systemd.go 服务管理任务
+type SystemdTask struct {
+	Name    string `yaml:"name"`              // 服务名称
+	State   string `yaml:"state"`             // started, stopped, restarted, reloaded
+	Enabled bool   `yaml:"enabled,omitempty"` // 是否设置开机自启
+	Daemon  bool   `yaml:"daemon,omitempty"`  // 是否执行 daemon-reload
+}
+
+// ArchiveTask 压缩/解压缩任务
+type ArchiveTask struct {
+	Path   string `yaml:"path"`             // 源路径（要压缩的文件/目录，或要解压的归档文件）
+	Dest   string `yaml:"dest"`             // 目标路径（压缩：生成的归档文件路径；解压：解压到的目录）
+	State  string `yaml:"state,omitempty"`  // "present" (压缩) 或 "absent" (解压)，默认 present
+	Format string `yaml:"format,omitempty"` // 压缩格式: "tar.gz", "tar.bz2", "tar.xz", "zip"。留空则从 dest 扩展名推断
+	Remove bool   `yaml:"remove,omitempty"` // 压缩后是否删除源文件/目录（仅当 state=present 时有效）
 }
