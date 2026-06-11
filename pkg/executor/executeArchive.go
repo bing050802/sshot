@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/types"
 )
 
 // executeArchive 执行压缩或解压缩

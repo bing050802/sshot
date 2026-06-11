@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/types"
 )
 
 // ANSI color codes

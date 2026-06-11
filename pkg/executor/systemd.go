@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/types"
 )
 
 // executeSystemd 执行 systemd 服务管理

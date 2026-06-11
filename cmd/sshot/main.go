@@ -7,8 +7,8 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/fgouteroux/sshot/pkg/playbook"
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/playbook"
+	"sshot/pkg/types"
 )
 
 // Build information set via ldflags

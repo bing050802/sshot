@@ -1,9 +1,9 @@
 package playbook
 
 import (
-	"github.com/fgouteroux/sshot/pkg/types"
 	"os"
 	"path/filepath"
+	"sshot/pkg/types"
 	"strings"
 	"testing"
 	"time"

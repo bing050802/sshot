@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/fgouteroux/sshot/pkg/types"
-	"github.com/fgouteroux/sshot/pkg/utils"
+	"sshot/pkg/types"
+	"sshot/pkg/utils"
 )
 
 // ExecuteHandlers 执行所有待执行的 handlers

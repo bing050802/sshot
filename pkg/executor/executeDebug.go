@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/fgouteroux/sshot/pkg/types"
-	"github.com/fgouteroux/sshot/pkg/utils"
+	"sshot/pkg/types"
+	"sshot/pkg/utils"
 )
 
 // executeDebug 输出调试信息

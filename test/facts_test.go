@@ -1,14 +1,14 @@
 package integration_test
 
 import (
-	"github.com/fgouteroux/sshot/pkg/playbook"
-	"github.com/fgouteroux/sshot/pkg/types"
-	"github.com/fgouteroux/sshot/pkg/config"
-	"github.com/fgouteroux/sshot/pkg/executor"
 	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sshot/pkg/config"
+	"sshot/pkg/executor"
+	"sshot/pkg/playbook"
+	"sshot/pkg/types"
 	"strings"
 	"testing"
 )

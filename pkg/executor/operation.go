@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/types"
 )
 
 // executeFile 执行文件操作

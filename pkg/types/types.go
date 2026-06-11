@@ -138,6 +138,10 @@ type Task struct {
 
 	Debug       *DebugTask   `yaml:"debug,omitempty"`
 	SetFactTask *SetFactTask `yaml:"set_fact,omitempty"`
+
+	DBExecFile *DBExecFileTask `yaml:"db_exec_file,omitempty"`
+	DBExecSQL  *DBExecSQLTask  `yaml:"db_exec_sql,omitempty"`
+	DBMigrate  *DBMigrateTask  `yaml:"db_migrate,omitempty"`
 }
 
 type CopyTask struct {

@@ -1,8 +1,8 @@
 package executor
 
 import (
-	"github.com/fgouteroux/sshot/pkg/types"
 	"bytes"
+	"sshot/pkg/types"
 	"strings"
 	"testing"
 )

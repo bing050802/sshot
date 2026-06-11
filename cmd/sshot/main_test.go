@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/types"
 )
 
 func TestExecutionOptions_Defaults(t *testing.T) {

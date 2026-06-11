@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/fgouteroux/sshot/pkg/playbook"
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/playbook"
+	"sshot/pkg/types"
 )
 
 func TestFullPlaybookExecution_DryRun(t *testing.T) {

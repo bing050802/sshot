@@ -5,8 +5,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/fgouteroux/sshot/pkg/types"
 	"gopkg.in/yaml.v3"
+	"sshot/pkg/types"
 )
 
 func unmarshalConfig(data []byte, config *types.Config) error {

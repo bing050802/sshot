@@ -1,7 +1,7 @@
 package utils
 
 import (
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/types"
 	"testing"
 	"time"
 )

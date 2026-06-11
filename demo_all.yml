@@ -167,6 +167,9 @@ tasks:
     command: /bin/false
     on_failure: handle_failure
     # 未设置 ignore_error，因此 playbook 会在此处停止
+  - name: 构造备份文件路径
+    set_fact:
+      bk_path: "{{ bk_mysql_path }}/dump_{{ vars_bk_mysql_name }}_{{ HHdate }}.sql"
 
 # ========================
 # Handlers（在所有任务执行完毕后统一执行）
@@ -195,3 +198,14 @@ handlers:
   - name: handle_failure
     debug:
       msg: "任务失败，执行紧急恢复"
+  - name: 执行数据库初始化
+    db_exec_sql:
+      driver: mysql
+      host: "{{ db_host }}"
+      user: "{{ db_user }}"
+      password: "{{ db_password }}"
+      database: webfolder
+      query: |
+        CREATE TABLE IF NOT EXISTS users (id INT);
+        INSERT INTO users VALUES (1);
+      log_file: ./logs/init_db.log

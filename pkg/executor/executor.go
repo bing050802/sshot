@@ -18,12 +18,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fgouteroux/sshot/pkg/types"
-	"github.com/fgouteroux/sshot/pkg/utils"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"sshot/pkg/types"
+	"sshot/pkg/utils"
 )
 
 // 本地操作系统类型
@@ -275,6 +275,13 @@ func (e *Executor) ExecuteTask(task types.Task, handlers []types.Task) error {
 		output, err = e.executeWaitFor(task.WaitFor)
 	case task.SetFactTask != nil:
 		output, err = e.executeSetFact(task.SetFactTask)
+
+	case task.DBExecFile != nil:
+		output, err = e.executeDBExecFile(task.DBExecFile)
+	case task.DBExecSQL != nil:
+		output, err = e.executeDBExecSQL(task.DBExecSQL)
+	case task.DBMigrate != nil:
+		output, err = e.executeDBMigrate(task.DBMigrate)
 	default:
 		return fmt.Errorf("no executable task type defined")
 	}

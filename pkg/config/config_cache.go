@@ -3,7 +3,7 @@ package config
 import (
 	"sync"
 
-	"github.com/fgouteroux/sshot/pkg/types"
+	"sshot/pkg/types"
 )
 
 // cache provides thread-safe access to the global config

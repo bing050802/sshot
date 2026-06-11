@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fgouteroux/sshot/pkg/config"
-	"github.com/fgouteroux/sshot/pkg/executor"
-	"github.com/fgouteroux/sshot/pkg/types"
-	"github.com/fgouteroux/sshot/pkg/utils"
+	"sshot/pkg/config"
+	"sshot/pkg/executor"
+	"sshot/pkg/types"
+	"sshot/pkg/utils"
 )
 
 func executeOnHost(host types.Host, tasks []types.Task, captureOutput bool, groupName string, handlers []types.Task) types.HostResult {
@@ -58,6 +58,7 @@ func executeOnHost(host types.Host, tasks []types.Task, captureOutput bool, grou
 	}
 
 	// 执行所有任务
+	var taskErr error
 	for i, task := range tasks {
 		taskStart := time.Now()
 		fmt.Fprintf(writer, "%s│%s [%d/%d] %s\n", utils.Color(utils.ColorCyan), utils.Color(utils.ColorReset), i+1, len(tasks), task.Name)
@@ -66,6 +67,7 @@ func executeOnHost(host types.Host, tasks []types.Task, captureOutput bool, grou
 			taskDuration := time.Since(taskStart)
 			fmt.Fprintf(writer, "  %s✗%s Task failed after %s: %v\n", utils.Color(utils.ColorRed), utils.Color(utils.ColorReset), utils.FormatDuration(taskDuration), err)
 			fmt.Fprintf(writer, "%s└─ ✗ Failed%s (total time: %s)\n\n", utils.Color(utils.ColorRed), utils.Color(utils.ColorReset), utils.FormatDuration(time.Since(hostStart)))
+			taskErr = err
 			break
 		}
 
@@ -80,6 +82,9 @@ func executeOnHost(host types.Host, tasks []types.Task, captureOutput bool, grou
 	if err := exec.ExecuteHandlers(handlers); err != nil {
 		fmt.Fprintf(writer, "%s│%s %s✗ Handler failed:%s %v\n", utils.Color(utils.ColorCyan), utils.Color(utils.ColorReset), utils.Color(utils.ColorRed), utils.Color(utils.ColorReset), err)
 		fmt.Fprintf(writer, "%s└─ ✗ Failed%s (total time: %s)\n\n", utils.Color(utils.ColorRed), utils.Color(utils.ColorReset), utils.FormatDuration(time.Since(hostStart)))
+		return types.HostResult{Host: host, Success: false, Error: err, Output: output.String()}
+	}
+	if taskErr != nil {
 		return types.HostResult{Host: host, Success: false, Error: err, Output: output.String()}
 	}
 
