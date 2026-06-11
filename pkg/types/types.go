@@ -41,6 +41,7 @@ type PlaybookConfig struct {
 	Parallel bool        `yaml:"parallel,omitempty"`
 	Facts    FactsConfig `yaml:"facts,omitempty"`
 	Tasks    []Task      `yaml:"tasks"`
+	Handlers []Task      `yaml:"handlers,omitempty"` // 关键
 }
 
 type ExecutionOptions struct {
@@ -99,7 +100,7 @@ type Playbook struct {
 	Parallel bool        `yaml:"parallel,omitempty"`
 	Facts    FactsConfig `yaml:"facts,omitempty"`
 	Tasks    []Task      `yaml:"tasks"`
-	Handlers []Task      `yaml:"handlers,omitempty"` // 新增：handlers 列表
+	Handlers []Task      `yaml:"handlers,omitempty"` // 关键
 }
 
 type Task struct {
@@ -131,7 +132,12 @@ type Task struct {
 	Systemd *SystemdTask `yaml:"systemd,omitempty"` // 新增
 	Archive *ArchiveTask `yaml:"archive,omitempty"`
 
-	Notify []string `yaml:"notify,omitempty"` // 新增：触发的 handler 名称列表
+	Notify    []string `yaml:"notify,omitempty"`     // 新增：触发的 handler 名称列表
+	OnFailure []string `yaml:"on_failure,omitempty"` // 失败时触发
+	Always    []string `yaml:"always,omitempty"`     // 无论成败都触发
+
+	Debug       *DebugTask   `yaml:"debug,omitempty"`
+	SetFactTask *SetFactTask `yaml:"set_fact,omitempty"`
 }
 
 type CopyTask struct {
@@ -178,4 +184,13 @@ type ArchiveTask struct {
 	State  string `yaml:"state,omitempty"`  // "present" (压缩) 或 "absent" (解压)，默认 present
 	Format string `yaml:"format,omitempty"` // 压缩格式: "tar.gz", "tar.bz2", "tar.xz", "zip"。留空则从 dest 扩展名推断
 	Remove bool   `yaml:"remove,omitempty"` // 压缩后是否删除源文件/目录（仅当 state=present 时有效）
+}
+
+type DebugTask struct {
+	Msg string `yaml:"msg,omitempty"` // 要输出的消息（支持变量替换）
+	Var string `yaml:"var,omitempty"` // 要输出的变量名称
+}
+
+type SetFactTask struct {
+	Vars map[string]interface{} `yaml:",inline"`
 }

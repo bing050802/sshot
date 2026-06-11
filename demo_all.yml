@@ -1,0 +1,197 @@
+---
+# 综合演示 Playbook - 涵盖所有已实现模块
+name: "sshot 全功能演示"
+parallel: false                        # 顺序执行，便于观察日志
+
+# 变量定义（也可放在 vars_files 中）
+vars:
+  app_name: demo_app
+  log_dir: /var/log/{{ app_name }}
+  backup_dir: /tmp/backup
+  nmon_log: /var/log/nmon
+  nmon_s: 5
+  nmon_c: 2
+
+# 可选：从外部文件加载变量
+vars_files: ./params.yaml
+
+# 收集系统信息（自定义 facts）
+facts:
+  collectors:
+    - name: os_id
+      command: cat /etc/os-release | grep '^ID=' | cut -d= -f2 | tr -d '"'
+      sudo: false
+    - name: kernel
+      command: uname -r
+      sudo: false
+
+# ========================
+# 任务列表
+# ========================
+tasks:
+
+  # 1. command 模块 - 简单命令，注册输出
+  - name: 获取主机名
+    command: hostname
+    register: hostname_out
+    notify: show_hostname        # 成功时触发 handler
+
+  # 2. debug 模块 - 输出变量
+  - name: 显示主机名
+    debug:
+      var: hostname_out.stdout
+
+  # 3. shell 模块 - 复杂管道
+  - name: 统计根目录文件数
+    shell: ls -la / | wc -l
+    register: file_count
+
+  # 4. debug 自定义消息
+  - name: 显示统计结果
+    debug:
+      msg: "根目录下共有 {{ file_count.stdout }} 个文件/目录"
+
+  # 5. file 模块 - 创建目录
+  - name: 创建应用日志目录
+    file:
+      path: "{{ log_dir }}"
+      state: directory
+      mode: 0755
+    sudo: true
+
+  # 6. file 模块 - 创建空文件
+  - name: 创建锁文件
+    file:
+      path: "{{ log_dir }}/.lock"
+      state: touch
+      mode: 0644
+    sudo: true
+
+  # 7. copy 模块 - 上传单个文件（假设本地存在 ./files/readme.txt）
+  - name: 上传 README
+    copy:
+      src: ./files/readme.txt
+      dest: "{{ log_dir }}/README.txt"
+      mode: "0644"
+    sudo: true
+    ignore_error: true           # 若文件不存在，忽略错误
+
+  # 8. copy 模块 - 递归上传目录（假设本地存在 ./webroot/）
+  - name: 部署静态网站
+    copy:
+      src: ./webroot/
+      dest: /var/www/html/
+      recursive: true
+      preserve: true
+    sudo: true
+    when: "os_id.stdout == 'ubuntu' or os_id.stdout == 'centos'"
+
+  # 9. fetch 模块 - 从远程拉取文件（保留目录结构）
+  - name: 拉取应用日志
+    fetch:
+      src: "{{ log_dir }}/README.txt"
+      dest: ./fetched/
+      flat: false
+    when: "hostname_out.stdout != 'localhost'"
+
+  # 10. script 模块 - 执行本地脚本（假设存在 ./scripts/deploy.sh）
+  - name: 运行部署脚本
+    script: ./scripts/deploy.sh
+    sudo: true
+    ignore_error: true
+    register: script_out
+    on_failure: handle_script_fail   # 失败时触发 handler
+
+  # 11. archive 模块 - 压缩目录
+  - name: 压缩日志目录
+    archive:
+      path: "{{ log_dir }}"
+      dest: "{{ backup_dir }}/logs.tar.gz"
+      format: tar.gz
+      remove: false
+    sudo: true
+    notify: cleanup_backup          # 成功时触发
+
+  # 12. archive 模块 - 解压缩（演示，实际需要先有压缩包）
+  - name: 解压备份（演示）
+    archive:
+      path: "{{ backup_dir }}/logs.tar.gz"
+      dest: "{{ backup_dir }}/extracted/"
+      state: absent
+    sudo: true
+    ignore_error: true
+
+  # 13. systemd 模块 - 启动并启用服务
+  - name: 启动 nginx
+    systemd:
+      name: nginx
+      state: started
+      enabled: true
+    sudo: true
+    when: "os_id.stdout == 'ubuntu' or os_id.stdout == 'centos'"
+    always: always_check_nginx     # 无论成败都触发
+
+  # 14. wait_for 模块 - 等待端口
+  - name: 等待 nginx 端口
+    wait_for: port:80
+    retries: 5
+    retry_delay: 2
+    timeout: 10
+
+  # 15. local_action 模块 - 控制机本地执行
+  - name: 在控制机创建报告目录
+    local_action: mkdir -p ./reports
+
+  # 16. 错误处理与重试
+  - name: 可能失败的任务（重试）
+    command: curl -s http://localhost:8080/health
+    register: health_check
+    retries: 3
+    retry_delay: 2
+    ignore_error: true
+    allowed_exit_codes: [0, 7]     # 7 代表连接拒绝，也允许
+
+  # 17. 条件执行 (when)
+  - name: 仅在 CentOS 上执行
+    command: echo "Running on CentOS"
+    when: "os_id.stdout == 'centos'"
+
+  # 18. 演示 always 触发（无论成败）
+  - name: 故意失败的任务
+    command: /bin/false
+    ignore_error: true
+    always: always_cleanup
+
+  # 19. 演示 on_failure 触发
+  - name: 另一个失败任务（不忽略）
+    command: /bin/false
+    on_failure: handle_failure
+    # 未设置 ignore_error，因此 playbook 会在此处停止
+
+# ========================
+# Handlers（在所有任务执行完毕后统一执行）
+# ========================
+handlers:
+  - name: show_hostname
+    debug:
+      msg: "主机名已被获取（handler）"
+
+  - name: cleanup_backup
+    command: rm -rf {{ backup_dir }}/old_*
+    sudo: true
+
+  - name: handle_script_fail
+    debug:
+      msg: "部署脚本执行失败，请检查！"
+
+  - name: always_check_nginx
+    debug:
+      msg: "nginx 状态检测已执行（always）"
+
+  - name: always_cleanup
+    shell: echo "清理临时文件..."
+    sudo: false
+
+  - name: handle_failure
+    debug:
+      msg: "任务失败，执行紧急恢复"

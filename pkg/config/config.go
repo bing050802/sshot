@@ -37,6 +37,7 @@ func unmarshalPlaybook(data []byte) (*types.Playbook, error) {
 		Parallel: pbConfig.Parallel,
 		Facts:    pbConfig.Facts,
 		Tasks:    pbConfig.Tasks,
+		Handlers: pbConfig.Handlers,
 	}, nil
 }
 

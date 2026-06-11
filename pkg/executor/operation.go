@@ -198,3 +198,15 @@ func (e *Executor) fileDirectory(path string, mode string) (string, error) {
 
 	return output, nil
 }
+
+func (e *Executor) executeSetFact(setFactTask *types.SetFactTask) (string, error) {
+	for key, value := range setFactTask.Vars {
+		strVal := fmt.Sprintf("%v", value)
+		substituted := e.SubstituteVars(strVal)
+		e.Variables[key] = substituted
+		if types.ExecOptions.Verbose {
+			fmt.Fprintf(e.OutputWriter, "    │ set_fact: %s = %s\n", key, substituted)
+		}
+	}
+	return "set_fact completed", nil
+}

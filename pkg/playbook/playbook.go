@@ -66,7 +66,7 @@ func executeOnHost(host types.Host, tasks []types.Task, captureOutput bool, grou
 			taskDuration := time.Since(taskStart)
 			fmt.Fprintf(writer, "  %s✗%s Task failed after %s: %v\n", utils.Color(utils.ColorRed), utils.Color(utils.ColorReset), utils.FormatDuration(taskDuration), err)
 			fmt.Fprintf(writer, "%s└─ ✗ Failed%s (total time: %s)\n\n", utils.Color(utils.ColorRed), utils.Color(utils.ColorReset), utils.FormatDuration(time.Since(hostStart)))
-			return types.HostResult{Host: host, Success: false, Error: err, Output: output.String()}
+			break
 		}
 
 		taskDuration := time.Since(taskStart)
@@ -281,6 +281,11 @@ func Run(playbookPath string, options *types.ExecutionOptions) error {
 		if len(cfg.Playbook.Handlers) > 0 {
 			log.Printf("[VERBOSE] Handlers: %d defined", len(cfg.Playbook.Handlers))
 		}
+		log.Printf("[DEBUG] Loaded %d handlers", len(cfg.Playbook.Handlers))
+		for i, h := range cfg.Playbook.Handlers {
+			log.Printf("[DEBUG] Handler %d: %s", i, h.Name)
+		}
+
 	}
 
 	if types.ExecOptions.DryRun {

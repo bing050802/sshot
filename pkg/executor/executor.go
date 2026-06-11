@@ -267,10 +267,14 @@ func (e *Executor) ExecuteTask(task types.Task, handlers []types.Task) error {
 		output, err = e.executeFile(task.File)
 	case task.Systemd != nil:
 		output, err = e.executeSystemd(task.Systemd)
+	case task.Debug != nil:
+		output, err = e.executeDebug(task.Debug)
 	case task.Archive != nil:
 		output, err = e.executeArchive(task.Archive)
 	case task.WaitFor != "":
 		output, err = e.executeWaitFor(task.WaitFor)
+	case task.SetFactTask != nil:
+		output, err = e.executeSetFact(task.SetFactTask)
 	default:
 		return fmt.Errorf("no executable task type defined")
 	}
@@ -284,28 +288,14 @@ func (e *Executor) ExecuteTask(task types.Task, handlers []types.Task) error {
 			e.mu.Unlock()
 		}
 	}
-
-	// 任务执行成功后，处理 notify
-	if err == nil && len(task.Notify) > 0 {
+	if len(task.Always) > 0 {
 		e.mu.Lock()
-		for _, handlerName := range task.Notify {
-			// 检查 handler 是否存在
-			handlerExists := false
-			for _, h := range handlers {
-				if h.Name == handlerName {
-					handlerExists = true
-					break
-				}
-			}
-			if !handlerExists {
-				e.mu.Unlock()
-				return fmt.Errorf("handler '%s' not found", handlerName)
-			}
-
-			// 添加到通知队列（去重）
+		for _, handlerName := range task.Always {
+			// 检查 handler 存在性等...
+			// 去重加入 e.NotifyQueue
 			alreadyQueued := false
-			for _, queued := range e.NotifyQueue {
-				if queued == handlerName {
+			for _, q := range e.NotifyQueue {
+				if q == handlerName {
 					alreadyQueued = true
 					break
 				}
@@ -313,11 +303,41 @@ func (e *Executor) ExecuteTask(task types.Task, handlers []types.Task) error {
 			if !alreadyQueued && !e.HandlersDone[handlerName] {
 				e.NotifyQueue = append(e.NotifyQueue, handlerName)
 				if types.ExecOptions.Verbose {
-					fmt.Fprintf(writer, "    │ Notified handler: %s\n", handlerName)
+					fmt.Fprintf(writer, "    │ Always triggered handler: %s\n", handlerName)
 				}
 			}
 		}
 		e.mu.Unlock()
+	}
+	// 任务执行成功后，处理 notify
+	if err == nil {
+		// 成功时处理 notify
+		if len(task.Notify) > 0 {
+			e.mu.Lock()
+			for _, h := range task.Notify {
+				if !contains(e.NotifyQueue, h) && !e.HandlersDone[h] {
+					e.NotifyQueue = append(e.NotifyQueue, h)
+					if types.ExecOptions.Verbose {
+						fmt.Fprintf(writer, "    │ Notified handler: %s\n", h)
+					}
+				}
+			}
+			e.mu.Unlock()
+		}
+	} else {
+		// 失败时处理 on_failure
+		if len(task.OnFailure) > 0 {
+			e.mu.Lock()
+			for _, h := range task.OnFailure {
+				if !contains(e.NotifyQueue, h) && !e.HandlersDone[h] {
+					e.NotifyQueue = append(e.NotifyQueue, h)
+					if types.ExecOptions.Verbose {
+						fmt.Fprintf(writer, "    │ OnFailure triggered handler: %s\n", h)
+					}
+				}
+			}
+			e.mu.Unlock()
+		}
 	}
 
 	if err != nil {
@@ -395,7 +415,14 @@ func (e *Executor) executeCommand(cmd string, sudo bool) (string, error) {
 	}
 	return strings.TrimSpace(output), nil
 }
-
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
 func (e *Executor) executeCommandWithNewSession(cmd string) (string, error) {
 	session, err := e.client.NewSession()
 	if err != nil {
