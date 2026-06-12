@@ -4,7 +4,7 @@ package types
 type DBExecFileTask struct {
 	Driver   string `yaml:"driver"` // mysql, kingbase, postgres, etc.
 	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
+	Port     string `yaml:"port"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	Database string `yaml:"database"`
@@ -16,7 +16,7 @@ type DBExecFileTask struct {
 type DBExecSQLTask struct {
 	Driver   string `yaml:"driver"`
 	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
+	Port     string `yaml:"port"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	Database string `yaml:"database"`
@@ -28,7 +28,7 @@ type DBExecSQLTask struct {
 type DBMigrateTask struct {
 	Driver        string `yaml:"driver"`
 	Host          string `yaml:"host"`
-	Port          int    `yaml:"port"`
+	Port          string `yaml:"port"`
 	User          string `yaml:"user"`
 	Password      string `yaml:"password"`
 	Database      string `yaml:"database"`

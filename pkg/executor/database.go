@@ -7,102 +7,149 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
 	"sshot/pkg/msql"
 	"sshot/pkg/types"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // getDBConnectionWithFallback 尝试直连数据库，失败则通过 SSH 隧道连接
-func (e *Executor) getDBConnectionWithFallback(driver, host string, port int, user, password, dbName string) (*sql.DB, error) {
+func (e *Executor) getDBConnectionWithFallback(driver, host string, port string, user, password, dbName string) (*sql.DB, error) {
 	// 1. 尝试直连
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?timeout=5s", user, password, host, port, dbName)
+	writer := e.OutputWriter
+	if writer == nil {
+		writer = os.Stdout
+	}
+	escPass := url.QueryEscape(password)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?timeout=5s", user, escPass, host, port, dbName)
+	if types.ExecOptions.Verbose {
+		fmt.Fprintf(writer, "    │ dsn %s\n", dsn)
+	}
 	db, err := sql.Open(driver, dsn)
 	if err == nil {
 		if err = db.Ping(); err == nil {
+			if types.ExecOptions.Verbose {
+				fmt.Fprintf(writer, "    │ ✗ %s\n", err)
+			}
 			return db, nil
 		}
 		db.Close()
 	}
 
 	// 2. 直连失败，尝试 SSH 隧道（如果 SSH 客户端可用）
-	if e.client == nil {
-		return nil, fmt.Errorf("direct connection failed and no SSH client available")
-	}
+	if e.client != nil {
+		localPort, err := e.startLocalPortForward(port) // 注意：不再传递 host，固定 127.0.0.1
+		if err != nil {
+			return nil, fmt.Errorf("failed to start SSH tunnel: %w", err)
+		}
+		tunnelDSN := fmt.Sprintf("%s:%s@tcp(127.0.0.1:%s)/%s?timeout=5s", user, escPass, localPort, dbName)
+		if types.ExecOptions.Verbose {
+			fmt.Fprintf(writer, "    │ tunnelDSN %s\n", tunnelDSN)
+		}
+		db, err := sql.Open(driver, tunnelDSN)
+		if err == nil {
+			if types.ExecOptions.Verbose {
+				fmt.Fprintf(writer, "    │  连接成功 %s\n", tunnelDSN)
+			}
+			if err = db.Ping(); err == nil {
+				if types.ExecOptions.Verbose {
+					fmt.Fprintf(writer, "    │  连接成功 %s\n", tunnelDSN)
+				}
+				return db, nil
+			}
+			if types.ExecOptions.Verbose {
+				fmt.Fprintf(writer, "    │ ✗ %s\n", err)
+			}
+			db.Close()
+		}
+		if types.ExecOptions.Verbose {
+			fmt.Fprintf(writer, "    │ ✗ %s\n", err)
+		}
 
-	localPort, err := e.startLocalPortForward(host, port)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start SSH tunnel: %w", err)
+		return nil, fmt.Errorf("direct connection and SSH tunnel both failed")
 	}
-
-	tunnelDSN := fmt.Sprintf("%s:%s@tcp(127.0.0.1:%d)/%s?timeout=5s", user, password, localPort, dbName)
-	db, err = sql.Open(driver, tunnelDSN)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database via tunnel: %w", err)
-	}
-	if err = db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database ping via tunnel failed: %w", err)
-	}
-	return db, nil
+	return nil, err
 }
 
 // startLocalPortForward 启动本地端口转发，返回本地监听端口
-func (e *Executor) startLocalPortForward(remoteHost string, remotePort int) (int, error) {
+func (e *Executor) startLocalPortForward(port string) (string, error) {
+	writer := e.OutputWriter
+	if writer == nil {
+		writer = os.Stdout
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 0, err
+		if types.ExecOptions.Verbose {
+			fmt.Fprintf(writer, "    │ ✗ %s\n", err)
+		}
+		return "", err
 	}
 	localPort := listener.Addr().(*net.TCPAddr).Port
 
-	// 后台协程处理转发
 	go func() {
 		for {
 			localConn, err := listener.Accept()
 			if err != nil {
-				return // 监听器关闭时退出
+				if types.ExecOptions.Verbose {
+					fmt.Fprintf(writer, "    │ ✗ %s\n", err)
+				}
+				continue
 			}
 			go func(local net.Conn) {
 				defer local.Close()
-				remoteAddr := fmt.Sprintf("%s:%d", remoteHost, remotePort)
-				remoteConn, err := e.client.Dial("tcp", remoteAddr)
+				// 关键：始终连接远程主机的 127.0.0.1
+				remoteConn, err := e.client.Dial("tcp", fmt.Sprintf("127.0.0.1:%s", port))
 				if err != nil {
+					if types.ExecOptions.Verbose {
+						fmt.Fprintf(writer, "    │ ✗ %s\n", err)
+					}
 					return
 				}
 				defer remoteConn.Close()
-				// 双向转发数据
 				go func() { _, _ = io.Copy(remoteConn, local) }()
 				_, _ = io.Copy(local, remoteConn)
 			}(localConn)
 		}
 	}()
-
-	return localPort, nil
+	return strconv.Itoa(localPort), nil
 }
-
 func (e *Executor) executeDBExecFile(task *types.DBExecFileTask) (string, error) {
 	writer := e.OutputWriter
 	if writer == nil {
 		writer = os.Stdout
 	}
 
-	restore, err := e.setupMsqlLoggerForTask(task.LogFile)
+	driver := e.SubstituteVars(task.Driver)
+	host := e.SubstituteVars(task.Host)
+	portStr := e.SubstituteVars(task.Port)
+	user := e.SubstituteVars(task.User)
+	password := e.SubstituteVars(task.Password)
+	database := e.SubstituteVars(task.Database)
+	scriptsPath := e.SubstituteVars(task.Path)
+
+	logFile := e.SubstituteVars(task.LogFile)
+
+	restore, err := e.setupMsqlLoggerForTask(logFile)
 	if err != nil {
 		return "", err
 	}
 	defer restore()
 
 	// 检查 SQL 文件是否存在
-	absPath := toLocalPath(task.Path)
+	absPath := toLocalPath(scriptsPath)
 	if _, err := os.Stat(absPath); err != nil {
 		return "", fmt.Errorf("SQL file not found: %s", absPath)
 	}
 
 	// 获取数据库连接
-	db, err := e.getDBConnectionWithFallback(task.Driver, task.Host, task.Port, task.User, task.Password, task.Database)
+	db, err := e.getDBConnectionWithFallback(driver, host, portStr, user, password, database)
 	if err != nil {
 		return "", err
 	}
@@ -111,8 +158,8 @@ func (e *Executor) executeDBExecFile(task *types.DBExecFileTask) (string, error)
 	// 使用 msql.DbSql 包装器执行文件
 	dbWrapper := &msql.DbSql{
 		Db:     db,
-		Driver: task.Driver,
-		DBName: task.Database,
+		Driver: driver,
+		DBName: database,
 	}
 
 	success, err := dbWrapper.ExSqlFile2(absPath) // 复用你已有的方法
@@ -131,11 +178,21 @@ func (e *Executor) executeDBExecSQL(task *types.DBExecSQLTask) (string, error) {
 		writer = os.Stdout
 	}
 
+	driver := e.SubstituteVars(task.Driver)
+	host := e.SubstituteVars(task.Host)
+	portStr := e.SubstituteVars(task.Port)
+	user := e.SubstituteVars(task.User)
+	password := e.SubstituteVars(task.Password)
+	database := e.SubstituteVars(task.Database)
+	scriptsPath := e.SubstituteVars(task.Query)
+
+	logFile1 := e.SubstituteVars(task.LogFile)
+
 	// 设置详细日志输出目标
 	var detailWriter io.Writer = io.Discard
 	var logFile *os.File
 	if task.LogFile != "" {
-		dir := filepath.Dir(task.LogFile)
+		dir := filepath.Dir(logFile1)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return "", fmt.Errorf("failed to create log directory: %w", err)
 		}
@@ -151,7 +208,7 @@ func (e *Executor) executeDBExecSQL(task *types.DBExecSQLTask) (string, error) {
 	fmt.Fprintf(writer, "    │ Executing SQL statements...\n")
 
 	// 获取数据库连接（支持直连或 SSH 隧道）
-	db, err := e.getDBConnectionWithFallback(task.Driver, task.Host, task.Port, task.User, task.Password, task.Database)
+	db, err := e.getDBConnectionWithFallback(driver, host, portStr, user, password, database)
 	if err != nil {
 		fmt.Fprintf(writer, "    │ ✗ Failed to connect to database: %v\n", err)
 		return "", err
@@ -159,7 +216,7 @@ func (e *Executor) executeDBExecSQL(task *types.DBExecSQLTask) (string, error) {
 	defer db.Close()
 
 	// 分割 SQL 语句（按分号，忽略注释和空语句）
-	statements := splitSQLStatements(task.Query)
+	statements := splitSQLStatements(scriptsPath)
 	executed := 0
 	var execErrors []string
 
@@ -223,12 +280,29 @@ func (e *Executor) executeDBMigrate(task *types.DBMigrateTask) (string, error) {
 	if writer == nil {
 		writer = os.Stdout
 	}
-	restore, err := e.setupMsqlLoggerForTask(task.LogFile)
+
+	driver := e.SubstituteVars(task.Driver)
+	host := e.SubstituteVars(task.Host)
+	portStr := e.SubstituteVars(task.Port)
+	user := e.SubstituteVars(task.User)
+	password := e.SubstituteVars(task.Password)
+	database := e.SubstituteVars(task.Database)
+	scriptsPath := e.SubstituteVars(task.ScriptsPath)
+
+	logFile := e.SubstituteVars(task.LogFile)
+
+	restore, err := e.setupMsqlLoggerForTask(logFile)
 	if err != nil {
 		return "", err
 	}
 	defer restore()
-	db, err := e.getDBConnectionWithFallback(task.Driver, task.Host, task.Port, task.User, task.Password, task.Database)
+
+	absPath := toLocalPath(scriptsPath)
+	if _, err := os.Stat(absPath); err != nil {
+		return "", fmt.Errorf("SQL file not found: %s", absPath)
+	}
+
+	db, err := e.getDBConnectionWithFallback(driver, host, portStr, user, password, database)
 	if err != nil {
 		return "", err
 	}
@@ -236,8 +310,8 @@ func (e *Executor) executeDBMigrate(task *types.DBMigrateTask) (string, error) {
 
 	dbWrapper := &msql.DbSql{
 		Db:     db,
-		Driver: task.Driver,
-		DBName: task.Database,
+		Driver: driver,
+		DBName: database,
 	}
 
 	targetVersion := task.TargetVersion
@@ -256,7 +330,7 @@ func (e *Executor) executeDBMigrate(task *types.DBMigrateTask) (string, error) {
 	}
 
 	// 执行升级（使用你已有的 UpdateWebVersion2 方法）
-	err = dbWrapper.UpdateWebVersion2(task.ScriptsPath, targetVersion, logCallback)
+	err = dbWrapper.UpdateWebVersion2(absPath, targetVersion, logCallback)
 	if err != nil {
 		return "", fmt.Errorf("database migration failed: %w", err)
 	}
