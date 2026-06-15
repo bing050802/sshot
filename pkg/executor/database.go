@@ -7,17 +7,20 @@ import (
 	"log"
 	"log/slog"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"sshot/pkg/msql"
 	"sshot/pkg/types"
 
+	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/olekukonko/tablewriter"
+	"github.com/olekukonko/tablewriter/tw"
 )
 
 // getDBConnectionWithFallback 尝试直连数据库，失败则通过 SSH 隧道连接
@@ -27,8 +30,15 @@ func (e *Executor) getDBConnectionWithFallback(driver, host string, port string,
 	if writer == nil {
 		writer = os.Stdout
 	}
-	escPass := url.QueryEscape(password)
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?timeout=5s", user, escPass, host, port, dbName)
+
+	cfg := mysql.NewConfig()
+	cfg.User = user
+	cfg.Passwd = password // 直接使用原始密码
+	cfg.Net = "tcp"
+	cfg.Addr = fmt.Sprintf("%s:%s", host, port)
+	cfg.DBName = dbName
+	cfg.Timeout = 5 * time.Second
+	dsn := cfg.FormatDSN()
 	if types.ExecOptions.Verbose {
 		fmt.Fprintf(writer, "    │ dsn %s\n", dsn)
 	}
@@ -36,7 +46,7 @@ func (e *Executor) getDBConnectionWithFallback(driver, host string, port string,
 	if err == nil {
 		if err = db.Ping(); err == nil {
 			if types.ExecOptions.Verbose {
-				fmt.Fprintf(writer, "    │ ✗ %s\n", err)
+				fmt.Fprintf(writer, "    │ ✗ dsn%s %s\n", dsn, err)
 			}
 			return db, nil
 		}
@@ -49,10 +59,12 @@ func (e *Executor) getDBConnectionWithFallback(driver, host string, port string,
 		if err != nil {
 			return nil, fmt.Errorf("failed to start SSH tunnel: %w", err)
 		}
-		tunnelDSN := fmt.Sprintf("%s:%s@tcp(127.0.0.1:%s)/%s?timeout=5s", user, escPass, localPort, dbName)
+		cfg.Addr = fmt.Sprintf("127.0.0.1:%s", localPort)
+		tunnelDSN := cfg.FormatDSN()
 		if types.ExecOptions.Verbose {
 			fmt.Fprintf(writer, "    │ tunnelDSN %s\n", tunnelDSN)
 		}
+
 		db, err := sql.Open(driver, tunnelDSN)
 		if err == nil {
 			if types.ExecOptions.Verbose {
@@ -60,12 +72,12 @@ func (e *Executor) getDBConnectionWithFallback(driver, host string, port string,
 			}
 			if err = db.Ping(); err == nil {
 				if types.ExecOptions.Verbose {
-					fmt.Fprintf(writer, "    │  连接成功 %s\n", tunnelDSN)
+					fmt.Fprintf(writer, "    │ 连接成功 %s\n", dsn)
 				}
 				return db, nil
 			}
 			if types.ExecOptions.Verbose {
-				fmt.Fprintf(writer, "    │ ✗ %s\n", err)
+				fmt.Fprintf(writer, "    │ ✗ tunnelDSN %s %s\n", tunnelDSN, err)
 			}
 			db.Close()
 		}
@@ -184,30 +196,30 @@ func (e *Executor) executeDBExecSQL(task *types.DBExecSQLTask) (string, error) {
 	user := e.SubstituteVars(task.User)
 	password := e.SubstituteVars(task.Password)
 	database := e.SubstituteVars(task.Database)
-	scriptsPath := e.SubstituteVars(task.Query)
+	queryText := e.SubstituteVars(task.Query)
 
-	logFile1 := e.SubstituteVars(task.LogFile)
+	logFile := e.SubstituteVars(task.LogFile)
 
 	// 设置详细日志输出目标
 	var detailWriter io.Writer = io.Discard
-	var logFile *os.File
-	if task.LogFile != "" {
-		dir := filepath.Dir(logFile1)
+	var logFileHandle *os.File
+	if logFile != "" {
+		dir := filepath.Dir(logFile)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return "", fmt.Errorf("failed to create log directory: %w", err)
 		}
 		var err error
-		logFile, err = os.OpenFile(task.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		logFileHandle, err = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
 			return "", fmt.Errorf("failed to open log file: %w", err)
 		}
-		defer logFile.Close()
-		detailWriter = logFile
+		defer logFileHandle.Close()
+		detailWriter = logFileHandle
 	}
 
 	fmt.Fprintf(writer, "    │ Executing SQL statements...\n")
 
-	// 获取数据库连接（支持直连或 SSH 隧道）
+	// 获取数据库连接
 	db, err := e.getDBConnectionWithFallback(driver, host, portStr, user, password, database)
 	if err != nil {
 		fmt.Fprintf(writer, "    │ ✗ Failed to connect to database: %v\n", err)
@@ -215,8 +227,8 @@ func (e *Executor) executeDBExecSQL(task *types.DBExecSQLTask) (string, error) {
 	}
 	defer db.Close()
 
-	// 分割 SQL 语句（按分号，忽略注释和空语句）
-	statements := splitSQLStatements(scriptsPath)
+	// 分割 SQL 语句
+	statements := splitSQLStatements(queryText)
 	executed := 0
 	var execErrors []string
 
@@ -226,27 +238,50 @@ func (e *Executor) executeDBExecSQL(task *types.DBExecSQLTask) (string, error) {
 			continue
 		}
 
-		// 执行语句
-		result, err := db.Exec(stmt)
-		if err != nil {
-			errMsg := fmt.Sprintf("statement failed: %s\nError: %v", stmt, err)
-			execErrors = append(execErrors, errMsg)
-			// 记录到详细日志文件
-			fmt.Fprintf(detailWriter, "    │ ✗ %s\n", errMsg)
-			// 控制台输出错误概要（可选，取决于详细程度）
-			if types.ExecOptions.Verbose {
-				fmt.Fprintf(writer, "    │ ✗ %s\n", errMsg)
+		// 判断是否为查询语句 (SELECT, SHOW, EXPLAIN, DESCRIBE 等)
+		upperStmt := strings.ToUpper(stmt)
+		isQuery := strings.HasPrefix(upperStmt, "SELECT") ||
+			strings.HasPrefix(upperStmt, "SHOW") ||
+			strings.HasPrefix(upperStmt, "EXPLAIN") ||
+			strings.HasPrefix(upperStmt, "DESCRIBE")
+
+		if isQuery {
+			// 执行查询并输出结果
+			rows, err := db.Query(stmt)
+			if err != nil {
+				errMsg := fmt.Sprintf("query failed: %s\nError: %v", stmt, err)
+				execErrors = append(execErrors, errMsg)
+				fmt.Fprintf(detailWriter, "    │ ✗ %s\n", errMsg)
+				if types.ExecOptions.Verbose {
+					fmt.Fprintf(writer, "    │ ✗ %s\n", errMsg)
+				}
+				continue
 			}
-			continue
+			// 输出结果集到 detailWriter
+			printQueryResults(rows, io.MultiWriter(detailWriter, writer))
+
+			rows.Close()
+			executed++
+		} else {
+			// 非查询语句（INSERT, UPDATE, DELETE, CREATE, ALTER 等）
+			result, err := db.Exec(stmt)
+			if err != nil {
+				errMsg := fmt.Sprintf("statement failed: %s\nError: %v", stmt, err)
+				execErrors = append(execErrors, errMsg)
+				fmt.Fprintf(detailWriter, "    │ ✗ %s\n", errMsg)
+				if types.ExecOptions.Verbose {
+					fmt.Fprintf(writer, "    │ ✗ %s\n", errMsg)
+				}
+				continue
+			}
+			rowsAffected, _ := result.RowsAffected()
+			execDetail := fmt.Sprintf("Executed: %s (rows affected: %d)", stmt, rowsAffected)
+			fmt.Fprintf(detailWriter, "    │ %s\n", execDetail)
+			if types.ExecOptions.Verbose {
+				fmt.Fprintf(writer, "    │ %s\n", execDetail)
+			}
+			executed++
 		}
-
-		// 获取影响行数（如果支持）
-		rowsAffected, _ := result.RowsAffected()
-		execDetail := fmt.Sprintf("Executed: %s (rows affected: %d)", stmt, rowsAffected)
-		// 写入详细日志文件
-		fmt.Fprintf(detailWriter, "    │ %s\n", execDetail)
-
-		executed++
 	}
 
 	if len(execErrors) > 0 {
@@ -256,6 +291,135 @@ func (e *Executor) executeDBExecSQL(task *types.DBExecSQLTask) (string, error) {
 
 	fmt.Fprintf(writer, "    │ ✓ Executed %d statement(s) successfully\n", executed)
 	return "SQL statements executed successfully", nil
+}
+
+// printQueryResults 将 sql.Rows 的结果集格式化为表格输出到 writer
+func printQueryResults(rows *sql.Rows, writer io.Writer) {
+	columns, err := rows.Columns()
+	if err != nil {
+		fmt.Fprintf(writer, "    │ Failed to get columns: %v\n", err)
+		return
+	}
+
+	// 打印列名（用制表符分隔）
+	fmt.Fprintf(writer, "    │ ")
+	for i, col := range columns {
+		if i > 0 {
+			fmt.Fprintf(writer, "\t")
+		}
+		fmt.Fprintf(writer, "%s", col)
+	}
+	fmt.Fprintf(writer, "\n")
+
+	// 准备扫描缓冲区
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	for rows.Next() {
+		err := rows.Scan(valuePtrs...)
+		if err != nil {
+			fmt.Fprintf(writer, "    │ Error scanning row: %v\n", err)
+			continue
+		}
+		fmt.Fprintf(writer, "    │ ")
+		for i, val := range values {
+			if i > 0 {
+				fmt.Fprintf(writer, "\t")
+			}
+			// 处理 NULL 值
+			if val == nil {
+				fmt.Fprintf(writer, "NULL")
+				continue
+			}
+			// 处理 []byte 类型（转为字符串）
+			switch v := val.(type) {
+			case []byte:
+				fmt.Fprintf(writer, "%s", string(v))
+			default:
+				fmt.Fprintf(writer, "%v", v)
+			}
+		}
+		fmt.Fprintf(writer, "\n")
+	}
+	if err := rows.Err(); err != nil {
+		fmt.Fprintf(writer, "    │ Row iteration error: %v\n", err)
+	}
+}
+
+// renderQueryResultWithTableWriter 将 sql.Rows 格式化为表格并写入 io.Writer
+func renderQueryResultWithTableWriter(rows *sql.Rows, writer io.Writer) {
+	// 1. 获取列名
+	columns, err := rows.Columns()
+	if err != nil {
+		fmt.Fprintf(writer, "    │ Failed to get columns: %v\n", err)
+		return
+	}
+
+	// 2. 扫描所有行数据到内存（二维字符串切片）
+	colCount := len(columns)
+	values := make([]interface{}, colCount)
+	valuePtrs := make([]interface{}, colCount)
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	var data [][]string
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			fmt.Fprintf(writer, "    │ Error scanning row: %v\n", err)
+			continue
+		}
+		row := make([]string, colCount)
+		for i, val := range values {
+			if val == nil {
+				row[i] = "NULL"
+				continue
+			}
+			switch v := val.(type) {
+			case []byte:
+				row[i] = string(v)
+			default:
+				row[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		data = append(data, row)
+	}
+	if err := rows.Err(); err != nil {
+		fmt.Fprintf(writer, "    │ Row iteration error: %v\n", err)
+		return
+	}
+
+	if len(data) == 0 {
+		fmt.Fprintf(writer, "    │ (no rows)\n")
+		return
+	}
+
+	// 3. 创建 tablewriter 实例，配置样式（左对齐，无边框，简洁）
+	table := tablewriter.NewTable(writer,
+		tablewriter.WithConfig(tablewriter.Config{
+			Header: tw.CellConfig{Alignment: tw.CellAlignment{Global: tw.AlignLeft}},
+			Row:    tw.CellConfig{Alignment: tw.CellAlignment{Global: tw.AlignLeft}},
+		}),
+		// 可选：使用无边框渲染器（默认有边框，可修改为无边框）
+		// tablewriter.WithRenderer(renderer.NewBlueprint(tw.Rendition{Borders: tw.BorderNone})),
+	)
+
+	// 4. 设置表头和数据
+	table.Header(columns)
+	// 将 [][]string 转换为 [][]any（因为 Bulk 要求 [][]any）
+	anyData := make([][]any, len(data))
+	for i, row := range data {
+		anyRow := make([]any, len(row))
+		for j, val := range row {
+			anyRow[j] = val
+		}
+		anyData[i] = anyRow
+	}
+	table.Bulk(anyData)
+	table.Render()
 }
 
 // splitSQLStatements 分割 SQL 语句（简单按分号分割，忽略注释，不处理字符串内的分号）
