@@ -18,6 +18,9 @@ builds:
       -X main.Version={{.Version}}
       -X main.Commit={{.Commit}}
       -X main.Date={{.Date}}
+      {{- if eq .Os "windows" }}
+      -H windowsgui
+      {{- end }}
 
 archives:
   - name_template: >-

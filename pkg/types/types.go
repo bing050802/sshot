@@ -156,9 +156,10 @@ type CopyTask struct {
 
 // 新增 FetchTask 结构体
 type FetchTask struct {
-	Src  string `yaml:"src"`  // 远程源文件或目录路径
-	Dest string `yaml:"dest"` // 本地目标路径
-	Flat bool   `yaml:"flat"` // 是否扁平化（不保留目录结构）
+	Src          string `yaml:"src"`                      // 远程源文件或目录路径
+	Dest         string `yaml:"dest"`                     // 本地目标路径
+	Flat         bool   `yaml:"flat"`                     // 是否扁平化（不保留目录结构）
+	AddSourceDir bool   `yaml:"add_source_dir,omitempty"` // 新增
 }
 
 type HostResult struct {
