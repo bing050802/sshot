@@ -36,7 +36,7 @@ func (e *Executor) executeArchive(archiveTask *types.ArchiveTask) (string, error
 
 	switch state {
 	case "present":
-		return e.compress(src, dest, format, remove)
+		return e.compress(src, dest, format, remove, archiveTask.Flat)
 	case "absent", "extract", "unarchive":
 		return e.decompress(src, dest, format)
 	default:
@@ -45,8 +45,13 @@ func (e *Executor) executeArchive(archiveTask *types.ArchiveTask) (string, error
 }
 
 // compress 压缩文件或目录
-func (e *Executor) compress(src, dest, format string, remove bool) (string, error) {
-	// 如果 format 为空，从 dest 扩展名推断
+// compress 压缩文件或目录
+// flat 参数说明：
+//   - 当源是目录时：
+//     flat = false（默认）：进入目录，打包其内部所有内容（不包含目录本身）
+//     flat = true：进入父目录，打包该目录本身（解压后会恢复顶层目录）
+//   - 当源是文件时：flat 参数无效，直接打包该文件
+func (e *Executor) compress(src, dest, format string, remove bool, flat bool) (string, error) {
 	writer := e.OutputWriter
 	if writer == nil {
 		writer = os.Stdout
@@ -70,29 +75,73 @@ func (e *Executor) compress(src, dest, format string, remove bool) (string, erro
 		return "", fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
+	// 判断源类型（文件/目录）
+	typeCmd := fmt.Sprintf("if [ -f '%s' ]; then echo 'file'; elif [ -d '%s' ]; then echo 'dir'; else echo 'other'; fi", src, src)
+	typeOut, _ := e.executeCommand(typeCmd, false)
+	fileType := strings.TrimSpace(typeOut)
+
+	if fileType == "other" {
+		return "", fmt.Errorf("source is not a regular file or directory: %s", src)
+	}
+
 	var compressCmd string
 	switch format {
 	case "tar.gz", "tgz":
-		compressCmd = fmt.Sprintf("tar -czf '%s' -C '%s' .", dest, src)
-		// 对于目录，需要进入目录打包所有内容
-		// 但 -C 选项要求 src 是目录，如果 src 是文件，则不能这样用
-		// 改进：判断 src 类型
-		typeCmd := fmt.Sprintf("if [ -f '%s' ]; then echo 'file'; elif [ -d '%s' ]; then echo 'dir'; else echo 'other'; fi", src, src)
-		typeOut, _ := e.executeCommand(typeCmd, false)
-		if strings.TrimSpace(typeOut) == "file" {
+		if fileType == "file" {
 			compressCmd = fmt.Sprintf("tar -czf '%s' -C '%s' '%s'", dest, filepath.Dir(src), filepath.Base(src))
-		} // 对目录保持 -C 方式
-	case "tar.bz2", "tbz2":
-		compressCmd = fmt.Sprintf("tar -cjf '%s' -C '%s' .", dest, src)
-		// 同上，需处理文件情况（略）
-	case "tar.xz":
-		compressCmd = fmt.Sprintf("tar -cJf '%s' -C '%s' .", dest, src)
-	case "zip":
-		// zip 需要不同处理
-		compressCmd = fmt.Sprintf("cd '%s' && zip -r '%s' .", src, dest)
-		if srcFileType(src) == "file" {
-			compressCmd = fmt.Sprintf("zip -j '%s' '%s'", dest, src)
+		} else { // directory
+			if flat {
+				// 打包目录本身（保留顶层目录）
+				parentDir := filepath.Dir(src)
+				baseName := filepath.Base(src)
+				compressCmd = fmt.Sprintf("tar -czf '%s' -C '%s' '%s'", dest, parentDir, baseName)
+			} else {
+				// 打包目录内容（不保留顶层目录）
+				compressCmd = fmt.Sprintf("tar -czf '%s' -C '%s' .", dest, src)
+			}
 		}
+
+	case "tar.bz2", "tbz2":
+		if fileType == "file" {
+			compressCmd = fmt.Sprintf("tar -cjf '%s' -C '%s' '%s'", dest, filepath.Dir(src), filepath.Base(src))
+		} else {
+			if flat {
+				parentDir := filepath.Dir(src)
+				baseName := filepath.Base(src)
+				compressCmd = fmt.Sprintf("tar -cjf '%s' -C '%s' '%s'", dest, parentDir, baseName)
+			} else {
+				compressCmd = fmt.Sprintf("tar -cjf '%s' -C '%s' .", dest, src)
+			}
+		}
+
+	case "tar.xz":
+		if fileType == "file" {
+			compressCmd = fmt.Sprintf("tar -cJf '%s' -C '%s' '%s'", dest, filepath.Dir(src), filepath.Base(src))
+		} else {
+			if flat {
+				parentDir := filepath.Dir(src)
+				baseName := filepath.Base(src)
+				compressCmd = fmt.Sprintf("tar -cJf '%s' -C '%s' '%s'", dest, parentDir, baseName)
+			} else {
+				compressCmd = fmt.Sprintf("tar -cJf '%s' -C '%s' .", dest, src)
+			}
+		}
+
+	case "zip":
+		if fileType == "file" {
+			compressCmd = fmt.Sprintf("zip -j '%s' '%s'", dest, src)
+		} else {
+			if flat {
+				// 打包目录本身：进入父目录，打包整个目录
+				parentDir := filepath.Dir(src)
+				baseName := filepath.Base(src)
+				compressCmd = fmt.Sprintf("cd '%s' && zip -r '%s' '%s'", parentDir, dest, baseName)
+			} else {
+				// 打包目录内容：进入目录，打包当前目录下所有内容
+				compressCmd = fmt.Sprintf("cd '%s' && zip -r '%s' .", src, dest)
+			}
+		}
+
 	default:
 		return "", fmt.Errorf("unsupported archive format: %s", format)
 	}

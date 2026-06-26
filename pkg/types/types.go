@@ -142,6 +142,8 @@ type Task struct {
 	DBExecFile *DBExecFileTask `yaml:"db_exec_file,omitempty"`
 	DBExecSQL  *DBExecSQLTask  `yaml:"db_exec_sql,omitempty"`
 	DBMigrate  *DBMigrateTask  `yaml:"db_migrate,omitempty"`
+
+	Sync *RemoteSyncTask `yaml:"sync,omitempty"`
 }
 
 type CopyTask struct {
@@ -188,6 +190,7 @@ type ArchiveTask struct {
 	State  string `yaml:"state,omitempty"`  // "present" (压缩) 或 "absent" (解压)，默认 present
 	Format string `yaml:"format,omitempty"` // 压缩格式: "tar.gz", "tar.bz2", "tar.xz", "zip"。留空则从 dest 扩展名推断
 	Remove bool   `yaml:"remove,omitempty"` // 压缩后是否删除源文件/目录（仅当 state=present 时有效）
+	Flat   bool   `yaml:"flat,omitempty"`   // true: 包含顶层目录; false: 不包含（默认）
 }
 
 type DebugTask struct {

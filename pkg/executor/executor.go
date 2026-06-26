@@ -18,12 +18,13 @@ import (
 	"sync"
 	"time"
 
+	"sshot/pkg/types"
+	"sshot/pkg/utils"
+
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
-	"sshot/pkg/types"
-	"sshot/pkg/utils"
 )
 
 // 本地操作系统类型
@@ -282,6 +283,8 @@ func (e *Executor) ExecuteTask(task types.Task, handlers []types.Task) error {
 		output, err = e.executeDBExecSQL(task.DBExecSQL)
 	case task.DBMigrate != nil:
 		output, err = e.executeDBMigrate(task.DBMigrate)
+	case task.Sync != nil:
+		output, err = e.executeRemoteSync(task.Sync)
 	default:
 		return fmt.Errorf("no executable task type defined")
 	}
@@ -482,67 +485,6 @@ func (e *Executor) executeScript(scriptPath string, sudo bool) (string, error) {
 	output, err := e.executeCommand(execCmd, false)
 	e.executeCommand(fmt.Sprintf("rm -f %s", tmpFile), false)
 	return output, err
-}
-
-func (e *Executor) executeCopy(copyTask *types.CopyTask) (string, error) {
-	// 本地源路径转换
-	src := e.SubstituteVars(copyTask.Src)
-	src = toLocalPath(src)
-
-	// 远程目标路径转换
-	dest := e.SubstituteVars(copyTask.Dest)
-	dest = toRemotePath(dest)
-
-	if types.ExecOptions.Verbose {
-		e.mu.Lock()
-		fmt.Printf("    │ Copy src (local): %s\n", src)
-		fmt.Printf("    │ Copy dest (remote): %s\n", dest)
-		e.mu.Unlock()
-	}
-
-	content, err := os.ReadFile(src)
-	if err != nil {
-		return "", fmt.Errorf("failed to read source file: %w", err)
-	}
-	contentStr := e.SubstituteVars(string(content))
-
-	// 创建远程目录
-	destDir := filepath.Dir(dest)
-	mkdirCmd := fmt.Sprintf("mkdir -p '%s'", destDir)
-	if _, err := e.executeCommand(mkdirCmd, false); err != nil {
-		return "", fmt.Errorf("failed to create remote directory: %w", err)
-	}
-
-	session, err := e.client.NewSession()
-	if err != nil {
-		return "", fmt.Errorf("failed to create session: %w", err)
-	}
-	defer session.Close()
-
-	cmd := fmt.Sprintf("cat > '%s'", dest)
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return "", err
-	}
-	if err := session.Start(cmd); err != nil {
-		return "", err
-	}
-	_, err = io.WriteString(stdin, contentStr)
-	if err != nil {
-		return "", err
-	}
-	stdin.Close()
-	if err := session.Wait(); err != nil {
-		return "", fmt.Errorf("failed to copy file: %w", err)
-	}
-
-	if copyTask.Mode != "" {
-		_, err = e.executeCommand(fmt.Sprintf("chmod %s '%s'", copyTask.Mode, dest), false)
-		if err != nil {
-			return "", err
-		}
-	}
-	return fmt.Sprintf("Copied %s to %s", src, dest), nil
 }
 
 func (e *Executor) executeWaitFor(condition string) (string, error) {
